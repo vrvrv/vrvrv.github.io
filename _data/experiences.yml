@@ -1,9 +1,16 @@
 - title: KAIST
   year: 2020 - Present
   designation: M.S., Mathematics
-  desc: lorem Lorem ipsum dolor sit amet, consectetur adipisicing elit. Ab aut commodi earum eligendi ipsum, laborum maiores mollitia, optio quam quis rerum totam voluptas voluptates. Excepturi fugiat nobis reprehenderit sequi veniam! 
+  desc: [
+    "GPA : 4.0 / 4.3",
+    "Advisor : Prof. Hyonho, Chun"]
 
 - title: Sogang University
   year: 2014 - 2020
   designation: B.S., Mathematics
-  desc: When I was a undergraduate student, I was highly interested in algebra and geometry.
+  desc: [
+    "GPA : 3.69 / 4.3",
+    "Major GPA : 4.08 / 4.3",
+    "Dean's list, 2018",
+    "Military Service : Sep. 2015 - May. 2017"]
+

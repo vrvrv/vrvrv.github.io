@@ -1,21 +1,34 @@
 - title: Topic modeling
-  desc: Back End adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
+  desc: [
+  "Probabilistic topic model",
+  "Nonparametric bayesian model",
+  "Neural topic model"]
   progress: 90%
-- title: High-dimensional statistics
-  desc: Web Design sit amet, consectetur adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
-  progress: 30%
-- title: Online learning
-  desc: Lorem ipsum dolor sit amet, consectetur adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
+  
+- title: Lifelong learning
+  desc: [
+  "Probabilistic topic model",
+  "Nonparametric bayesian model",
+  "Neural topic model"]
   progress: 50%
   
 - title: Sequential decision making under uncertainity
-  desc: Lorem ipsum dolor sit amet, consectetur adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
+  desc: [
+  "Probabilistic topic model",
+  "Nonparametric bayesian model",
+  "Neural topic model"]
   progress: 20%
 
 - title: Reinforcement learning
-  desc: Lorem ipsum dolor sit amet, consectetur adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
+  desc: [
+  "Probabilistic topic model",
+  "Nonparametric bayesian model",
+  "Neural topic model"]
   progress: 20%
 
 - title: Bandit Algorithms
-  desc: Lorem ipsum dolor sit amet, consectetur adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
+  desc: [
+  "Probabilistic topic model",
+  "Nonparametric bayesian model",
+  "Neural topic model"]
   progress: 15%
