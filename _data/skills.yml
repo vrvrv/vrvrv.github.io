@@ -1,23 +1,15 @@
-- title: Adobe Photoshop
+- title: Mathematcs
   desc: Lorem ipsum dolor sit amet, consectetur adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
   progress: 75%
 
-- title: Web Design
+- title: Statistics
   desc: Web Design sit amet, consectetur adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
   progress: 68% 
 
-- title: Back-End Development
+- title: Machine Learning
   desc: Back End adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
   progress: 90%
 
-- title: Javascript
+- title: Deep Learning
   desc: Lorem ipsum dolor sit amet, consectetur adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
   progress: 55%
-
-- title: HTML5 And CSS3
-  desc: Web Design sit amet, consectetur adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
-  progress: 88% 
-
-- title: Adobe Illustrator
-  desc: Back End adipisicing elit. Assumenda non in vitae animi aliquam facere minima molestiae veritatis.
-  progress: 20%
