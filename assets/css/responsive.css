@@ -8,7 +8,7 @@
 .portfolio-wrapper, 
 .blog-wrapper, 
 .testimonials-wrapper, 
-.contact-wrapper {
+.working_papers-wrapper {
     padding: 0px 0px;
 }
 .themeix-nav-logo {
@@ -21,7 +21,7 @@
 #portfolio,
 #blog,
 #testimonials,
-#contact{
+#working_papers{
 	padding-top:50px;
 	padding-bottom:30px;
 }
@@ -86,7 +86,7 @@
     bottom: -8px;
     height: 17px;
 }
-.contact-form h3 {
+.working_papers-form h3 {
     width: 100%;
 }
 .experiences-info-wrapper .experiences-datetime {
@@ -99,7 +99,7 @@
 .single-blog-content {
     padding: 10px;
 }
-.contact-form form {
+.working_papers-form form {
     padding: 30px;
 }
 .portfolio-item .portfolio-overlay {
@@ -114,7 +114,7 @@
 #background-wrap{
 	display:none;
 }
-.contact{
+.working_papers{
 	background-image:none;
 }
 }
@@ -130,7 +130,7 @@
 .portfolio-wrapper, 
 .blog-wrapper, 
 .testimonials-wrapper, 
-.contact-wrapper {
+.working_papers-wrapper {
     padding: 0px 0px;
 }
 #about {
@@ -192,7 +192,7 @@
 .work-history-wrapper{
 	margin-bottom:30px;
 }
-.contact-form h3 {
+.working_papers-form h3 {
     width: 100%;
 }
 .homepage-copyright{
@@ -233,7 +233,7 @@
 .testimonials-author-info {
     width: calc(100% - 80px);
 }
-.contact-form form {
+.working_papers-form form {
     padding: 20px;
 }
 .section-title .border-center{
@@ -255,7 +255,7 @@
 #portfolio,
 #blog,
 #testimonials,
-#contact{
+#working_papers{
 	padding-top:30px;
 	padding-bottom:30px;
 }
@@ -274,7 +274,7 @@
 #background-wrap{
 	display:none;
 }
-.contact{
+.working_papers{
 	background-image:none;
 }
 }
