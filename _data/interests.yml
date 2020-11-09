@@ -3,7 +3,7 @@
   "Probabilistic topic model",
   "Nonparametric bayesian model",
   "Neural topic model"]
-  progress: 90%
+  progress: 70%
   
 - title: Lifelong learning
   desc: [
@@ -12,23 +12,16 @@
   "Neural topic model"]
   progress: 50%
   
+- title: Federated learning
+  desc: [
+  "Probabilistic topic model",
+  "Nonparametric bayesian model",
+  "Neural topic model"]
+  progress: 20%
+
 - title: Sequential decision making under uncertainity
   desc: [
   "Probabilistic topic model",
   "Nonparametric bayesian model",
   "Neural topic model"]
   progress: 20%
-
-- title: Reinforcement learning
-  desc: [
-  "Probabilistic topic model",
-  "Nonparametric bayesian model",
-  "Neural topic model"]
-  progress: 20%
-
-- title: Bandit Algorithms
-  desc: [
-  "Probabilistic topic model",
-  "Nonparametric bayesian model",
-  "Neural topic model"]
-  progress: 15%

@@ -91,7 +91,7 @@ button:focus {
     box-shadow: none;
     outline:none;
 }
-.contact-form input:focus {
+.working_papers-form input:focus {
     box-shadow: none;
     outline:none;
 }
@@ -630,7 +630,7 @@ object {
 #portfolio,
 #blog,
 #testimonials,
-#contact{
+#working_papers{
     padding-top:80px;
     padding-bottom:30px;
 }
@@ -647,7 +647,7 @@ object {
 .portfolio-wrapper,
 .blog-wrapper,
 .testimonials-wrapper,
-.contact-wrapper{
+.working_papers-wrapper{
     padding:0 30px;
     
 }
@@ -1231,7 +1231,7 @@ object {
     text-transform: uppercase;
     margin: 10px 0px;
 }
-.contact-box {
+.working_papers-box {
     border: 2px solid #cccccc;
     background-color: #ffffff;
     padding: 60px 30px 30px;
@@ -1240,27 +1240,27 @@ object {
     -webkit-transition: 0.5s all;
     transition: 0.5s all;
 }
-.contact-box:last-child {
+.working_papers-box:last-child {
     margin-bottom:60px;
 }
-.contact-box  h5{
+.working_papers-box  h5{
     text-transform:capitalize;
 }
-.contact-box  p{
+.working_papers-box  p{
     margin:0;
 }
-.contact-box  a{
+.working_papers-box  a{
     display:inline-block;
     word-break:break-all;
 }
-.contact-box  .contact-border{
+.working_papers-box  .working_papers-border{
     width: 60px;
     height: 1px;
     background: #d0d0d0;
     margin:0 auto;
     margin-bottom: 15px;
 }
-.contact-box-logo {
+.working_papers-box-logo {
     width: 90px;
     height: 90px;
     position: absolute;
@@ -1274,17 +1274,17 @@ object {
     border-radius: 50px;
     padding-top: 15px;
 }
-.contact-form h3{    
+.working_papers-form h3{    
     width:60%;
     margin-bottom:60px;
     font-weight:400;
 }
-.contact-form h3 span{    
+.working_papers-form h3 span{    
     font-weight: 700;
     font-size: 48px;
     text-transform: capitalize;
 }
-.contact-form textarea{    
+.working_papers-form textarea{    
     width:100%;
     background: #ffffff;
     border:0;
@@ -1292,20 +1292,20 @@ object {
     padding: 15px;
     box-shadow:0 0 70px 0 #dadada;
 }
-.contact-form input{   
+.working_papers-form input{   
     background: #ffffff;
     border: 0;
     border-radius: 0;
     padding: 15px;
     box-shadow: 0 0 70px 0 #dadada;
 }
-.contact-form form{   
+.working_papers-form form{   
     padding: 60px 30px;
     background: #f8f7f7;
     z-index:2;
     max-width: 640px;
 }
-.contact-form button{   
+.working_papers-form button{   
     display: block;
     width: 100%;
     padding: 15px 15px;
@@ -1317,7 +1317,7 @@ object {
     -webkit-transition: 0.5s all;
     transition:0.5s all;
 }
-.contact-form button:hover{   
+.working_papers-form button:hover{   
     color:#0e0e0e;
     background: #f0f0f0;
     box-shadow:0 0 70px 0 #dadada !important;
