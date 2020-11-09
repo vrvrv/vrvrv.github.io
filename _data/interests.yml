@@ -5,19 +5,19 @@
   "Neural topic model"]
   progress: 70%
   
-- title: Lifelong learning
+- title: Differential privacy
   desc: [
   "Probabilistic topic model",
   "Nonparametric bayesian model",
   "Neural topic model"]
-  progress: 50%
+  progress: 10%
   
 - title: Federated learning
   desc: [
   "Probabilistic topic model",
   "Nonparametric bayesian model",
   "Neural topic model"]
-  progress: 20%
+  progress: 10%
 
 - title: Sequential decision making under uncertainity
   desc: [
