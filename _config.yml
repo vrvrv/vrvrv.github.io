@@ -1,4 +1,4 @@
-title: no style, please! # name of the site
+te-title: no style, please! # name of the site
 author: Riccardo Graziosi # name of site's author
 email: riccardo.graziosi97@gmail.com # email of site's author
 url: https://riggraz.dev # root address of the site
@@ -26,7 +26,7 @@ plugins:
   - jekyll-seo-tag
   - jektex
 
-theme: no-style-please
+remote-theme: no-style-please
 
 jektex:
   cache_dir: ".jektex-cache"
