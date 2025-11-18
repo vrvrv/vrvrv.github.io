@@ -28,6 +28,8 @@ plugins:
   - jekyll-seo-tag
   - jektex
 
+theme: no-style-please
+
 jektex:
   cache_dir: ".jektex-cache"
   ignore: ["*.xml"]
