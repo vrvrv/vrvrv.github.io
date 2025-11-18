@@ -25,6 +25,7 @@ plugins:
   - jekyll-feed
   - jekyll-seo-tag
   - jektex
+  - jekyll-remote-theme
 
 remote-theme: no-style-please
 
