@@ -2,7 +2,7 @@
 
 source "https://rubygems.org"
 
-gem "no-style-please"
+# gem "no-style-please"
 
 # gem "github-pages", "~> 232", group: :jekyll_plugins
 # If you have any plugins, put them here!
