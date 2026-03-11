@@ -1,0 +1,172 @@
+name: Daily vLLM/SGLang Post
+
+on:
+  schedule:
+    # 8:00 AM KST = 23:00 UTC (previous day)
+    - cron: '0 23 * * *'
+  workflow_dispatch: # manual trigger
+
+permissions:
+  contents: write
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+jobs:
+  generate-daily-post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+
+      - name: Set date (KST)
+        run: |
+          echo "POST_DATE=$(TZ=Asia/Seoul date '+%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Gather vLLM data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/daily-data
+
+          echo "=== vLLM Issues ===" > /tmp/daily-data/vllm-issues.txt
+          gh issue list --repo vllm-project/vllm --limit 20 --state all \
+            --json number,title,labels,createdAt,state,url \
+            --jq '.[] | "\(.state) #\(.number): \(.title) [\(.labels | map(.name) | join(", "))] (\(.createdAt[:10])) \(.url)"' \
+            >> /tmp/daily-data/vllm-issues.txt
+
+          echo "=== vLLM PRs ===" > /tmp/daily-data/vllm-prs.txt
+          gh pr list --repo vllm-project/vllm --limit 25 --state all \
+            --json number,title,labels,createdAt,state,mergedAt,url \
+            --jq '.[] | "\(.state) #\(.number): \(.title) [\(.labels | map(.name) | join(", "))] (\(.createdAt[:10])) \(.url)"' \
+            >> /tmp/daily-data/vllm-prs.txt
+
+          echo "=== vLLM Spec Decode PRs ===" > /tmp/daily-data/vllm-spec.txt
+          gh pr list --repo vllm-project/vllm --limit 10 --state all \
+            --search "speculative decoding" \
+            --json number,title,state,createdAt,url \
+            --jq '.[] | "\(.state) #\(.number): \(.title) (\(.createdAt[:10])) \(.url)"' \
+            >> /tmp/daily-data/vllm-spec.txt
+
+          echo "=== vLLM KV/NIXL/Pipeline PRs ===" > /tmp/daily-data/vllm-kv.txt
+          gh pr list --repo vllm-project/vllm --limit 10 --state all \
+            --search "pipeline parallel OR distributed kv OR kv connector OR nixl" \
+            --json number,title,state,createdAt,url \
+            --jq '.[] | "\(.state) #\(.number): \(.title) (\(.createdAt[:10])) \(.url)"' \
+            >> /tmp/daily-data/vllm-kv.txt
+
+          echo "=== vLLM IR / Model Runner PRs ===" > /tmp/daily-data/vllm-ir.txt
+          gh pr list --repo vllm-project/vllm --limit 10 --state all \
+            --search "vllm IR OR model runner" \
+            --json number,title,state,createdAt,url \
+            --jq '.[] | "\(.state) #\(.number): \(.title) (\(.createdAt[:10])) \(.url)"' \
+            >> /tmp/daily-data/vllm-ir.txt
+
+      - name: Gather SGLang data
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== SGLang Issues ===" > /tmp/daily-data/sglang-issues.txt
+          gh issue list --repo sgl-project/sglang --limit 20 --state all \
+            --json number,title,labels,createdAt,state,url \
+            --jq '.[] | "\(.state) #\(.number): \(.title) [\(.labels | map(.name) | join(", "))] (\(.createdAt[:10])) \(.url)"' \
+            >> /tmp/daily-data/sglang-issues.txt
+
+          echo "=== SGLang PRs ===" > /tmp/daily-data/sglang-prs.txt
+          gh pr list --repo sgl-project/sglang --limit 25 --state all \
+            --json number,title,labels,createdAt,state,mergedAt,url \
+            --jq '.[] | "\(.state) #\(.number): \(.title) [\(.labels | map(.name) | join(", "))] (\(.createdAt[:10])) \(.url)"' \
+            >> /tmp/daily-data/sglang-prs.txt
+
+          echo "=== SGLang Spec/KV/Pipeline PRs ===" > /tmp/daily-data/sglang-spec.txt
+          gh pr list --repo sgl-project/sglang --limit 10 --state all \
+            --search "speculative decoding OR MTP OR pipeline parallel OR kv cache OR expert parallel" \
+            --json number,title,state,createdAt,url \
+            --jq '.[] | "\(.state) #\(.number): \(.title) (\(.createdAt[:10])) \(.url)"' \
+            >> /tmp/daily-data/sglang-spec.txt
+
+      - name: Get previous posts for issue tracking
+        run: |
+          # Collect recent daily posts for continuity
+          ls -t _posts/*vllm-sglang-daily* 2>/dev/null | head -3 | while read f; do
+            echo "=== $(basename $f) ===" >> /tmp/daily-data/previous-posts.txt
+            cat "$f" >> /tmp/daily-data/previous-posts.txt
+            echo "" >> /tmp/daily-data/previous-posts.txt
+          done
+          [ -f /tmp/daily-data/previous-posts.txt ] || echo "No previous posts found." > /tmp/daily-data/previous-posts.txt
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Generate daily post with Claude
+        run: |
+          PROMPT=$(cat <<'PROMPT_EOF'
+          You are generating a daily blog post for a Jekyll blog about vLLM and SGLang LLM serving frameworks.
+
+          Today's date (KST): $POST_DATE
+
+          Here is the collected GitHub data:
+
+          --- vLLM Issues ---
+          $(cat /tmp/daily-data/vllm-issues.txt)
+
+          --- vLLM PRs ---
+          $(cat /tmp/daily-data/vllm-prs.txt)
+
+          --- vLLM Speculative Decoding ---
+          $(cat /tmp/daily-data/vllm-spec.txt)
+
+          --- vLLM KV/NIXL/Pipeline ---
+          $(cat /tmp/daily-data/vllm-kv.txt)
+
+          --- vLLM IR / Model Runner ---
+          $(cat /tmp/daily-data/vllm-ir.txt)
+
+          --- SGLang Issues ---
+          $(cat /tmp/daily-data/sglang-issues.txt)
+
+          --- SGLang PRs ---
+          $(cat /tmp/daily-data/sglang-prs.txt)
+
+          --- SGLang Spec/KV/Pipeline ---
+          $(cat /tmp/daily-data/sglang-spec.txt)
+
+          --- Previous Posts (for issue tracking continuity) ---
+          $(cat /tmp/daily-data/previous-posts.txt)
+
+          Generate a Jekyll blog post with:
+          1. Front matter: layout: post, category: llm-serving, title: "vLLM/SGLang Daily - $POST_DATE"
+          2. Highlights section (2-3 key takeaways)
+          3. Sections organized by topic:
+             - Speculative Decoding (DFlash, Eagle, MTP, FSM, etc.)
+             - vLLM IR / Model Runner V2
+             - Distributed KV Cache / KV Connector (NIXL, FlexKV, Mooncake, etc.)
+             - Pipeline Parallel / Large Scale Serving
+             - Notable Issues & Bugs
+             - Community & Ecosystem
+          4. Each section should have a table of relevant PRs/issues with links
+          5. "Issue Tracking" subsections that reference previous posts for continuity
+          6. Write in Korean for descriptions, keep technical terms in English
+          7. Sources footer
+
+          Output ONLY the markdown content, nothing else.
+          PROMPT_EOF
+          )
+
+          # Use envsubst for POST_DATE and eval for file contents
+          export POST_DATE="${POST_DATE}"
+          FINAL_PROMPT=$(eval echo "$PROMPT")
+
+          claude -p "$FINAL_PROMPT" --output-format text > "_posts/${POST_DATE}-vllm-sglang-daily.md"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "_posts/${POST_DATE}-vllm-sglang-daily.md"
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Add vLLM/SGLang daily post for ${POST_DATE}
+
+          Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
+          git push origin dev
