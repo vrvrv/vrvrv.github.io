@@ -23,7 +23,7 @@
 - GPU/특정 vendor에 specific한 버그 수정은 중요도 낮음 (NPU 회사 재직 중이므로 하드웨어 중립적/아키텍처 레벨 내용 우선)
 - Issue tracking: reference previous daily posts for PR/issue continuity
 - Language: Korean descriptions, English technical terms
-- Summary style: each PR must explain (1) problem background, (2) what it does, (3) effect/impact with benchmark numbers when available
+- Summary style: 각 섹션(테이블 아래)에 8~12줄의 심층 분석을 포함. 해당 영역의 vLLM/SGLang 내부 구조, PR 간 맥락, 개발 트렌드를 서술하여 블로그만 읽어도 내부 동작을 이해할 수 있게 함. PR 개별 요약은 테이블 내 1~2줄.
 - No blockquote concept explanations per section (too verbose)
 - Blog & Article Highlights: only include posts published on the same day
 - No GitHub Actions workflow
