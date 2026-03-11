@@ -51,6 +51,7 @@ DeepSeek v3.2 멀티노드 이슈([#20336](https://github.com/sgl-project/sglang
 - **vLLM [#36771](https://github.com/vllm-project/vllm/issues/36771)**: LMCache가 vLLM 0.17.0과 호환 불가. PyTorch 2.10 C++ 심볼 변경 → import 크래시
 - **vLLM [#36755](https://github.com/vllm-project/vllm/issues/36755)**: preemption 시 캐시 히트 카운터 미리셋 → Prometheus counter 음수 크래시. async scheduling + KV connector 환경
 - **SGLang [#20334](https://github.com/sgl-project/sglang/issues/20334)**: CUDA Graph + MTP + page_size=64에서 MiMo-V2-Flash precision 저하
+
 ## Community & Ecosystem
 
 - **vLLM [#36786](https://github.com/vllm-project/vllm/pull/36786)**: EPLB 지원 확장 — 인기 expert를 여러 GPU에 복제하여 부하 분산
