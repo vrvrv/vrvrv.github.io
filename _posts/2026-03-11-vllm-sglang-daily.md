@@ -70,7 +70,7 @@ prefill/decode 각각의 attn/EP/DP group 생명주기를 분리하지 않으면
 결국 SGLang 대규모 서빙 트랙은 "kernel + scheduler + comm group + bootstrap I/O"를
 하나의 파이프라인으로 최적화하는 방향으로 이동 중이며,
 3/10에서 확인된 PD/PP 확장 흐름이 3/11에는 장애 모드와 복구 경로 검증으로 이어진다.
-즉 "더 빠르게"보다 "더 오래 안정적으로"가 이번 날짜의 핵심 트렌드다.
+즉 "더 빠르게"보다 "더 오래 안정적으로"가 3/11 변경 묶음의 핵심 트렌드다.
 
 ## Notable Issues & Bugs
 
