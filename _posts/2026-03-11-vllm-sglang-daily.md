@@ -9,6 +9,7 @@ title: "vLLM/SGLang Daily - 2026-03-11"
 오늘은 speculative path 안정화와 대규모 MoE 운영 안정성 이슈가 동시에 부각된 날이다.
 vLLM은 DFlash spec decode 통합과 NIXL hybrid SSM-FA RFC로 "attention backend/descriptor 다변화"를 밀었고,
 SGLang은 DeepSeek-V3.2 멀티노드 stall/dispatch 실패 리포트와 Pod Attention/HiSparse로 "고부하 운영 병목"을 정면으로 다뤘다.
+요약하면 두 프로젝트 모두 단일 커널 최적화에서 벗어나, scheduler-communication-memory를 함께 다루는 시스템 통합 단계로 이동 중이다.
 
 ## Speculative Decoding
 
@@ -69,6 +70,7 @@ prefill/decode 각각의 attn/EP/DP group 생명주기를 분리하지 않으면
 결국 SGLang 대규모 서빙 트랙은 "kernel + scheduler + comm group + bootstrap I/O"를
 하나의 파이프라인으로 최적화하는 방향으로 이동 중이며,
 3/10에서 확인된 PD/PP 확장 흐름이 3/11에는 장애 모드와 복구 경로 검증으로 이어진다.
+즉 "더 빠르게"보다 "더 오래 안정적으로"가 이번 날짜의 핵심 트렌드다.
 
 ## Notable Issues & Bugs
 
