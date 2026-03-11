@@ -16,7 +16,7 @@ SGLang은 DeepSeek-V3.2 멀티노드 stall/dispatch 실패 리포트와 Pod Atte
 |----|------|--------|------|
 | [#36767](https://github.com/vllm-project/vllm/pull/36767) | vLLM | Open | DFlash를 speculative proposer 경로에 통합. Qwen3-8B, draft=16, max_tokens=2048에서 batch=32 기준 2741 tok/s로 SGLang 2540 tok/s 대비 약 8% 높음. |
 | [#20355](https://github.com/sgl-project/sglang/pull/20355) | SGLang | Open | MTP 모델에 `layers` 속성이 없는 경우 piecewise CUDA graph를 비활성화해 크래시를 방지. SpecForge 계열 Eagle3 모델의 graph 안정성 보강. |
-| [#19775](https://github.com/sgl-project/sglang/pull/19775) | SGLang | Merged | verify_target의 GDN 경로에서 gating+recurrent update 커널을 재구성. Qwen3-Next 8k/1.5k 벤치에서 TTFT 약 11% 개선 보고. |
+| [#19775](https://github.com/sgl-project/sglang/pull/19775) | SGLang | Merged | verify_target의 GDN 경로에서 gating+recurrent update 커널을 재구성. Qwen3-Next 8k/1.5k 벤치에서 TTFT 약 11%, output tok/s 약 13% 개선 보고. |
 
 vLLM의 #36767은 `vllm/v1/spec_decode/eagle.py`와 `gpu_model_runner.py`를 건드리며,
 spec decode를 "PagedAttention 전제"에서 "backend-특화 metadata 선택" 구조로 이동시키는 단계다.
@@ -51,7 +51,7 @@ PD disaggregation에서 decode 병목을 메모리 상주량으로 직접 완화
 
 | PR/Issue | Repo | Status | 요약 |
 |----------|------|--------|------|
-| [#20346](https://github.com/sgl-project/sglang/pull/20346) | SGLang | Open | Mixed Chunk Prefill에서 Pod Attention 커널을 선택 적용. 고동시·장입력 구간에서 throughput +4~48%, TTFT -5~30%, 피크 +47.7% 보고. |
+| [#20346](https://github.com/sgl-project/sglang/pull/20346) | SGLang | Open | Mixed Chunk Prefill에서 Pod Attention 커널을 선택 적용. 고동시·장입력 구간에서 throughput +4~48%, TTFT/TPOT -5~30%, 피크 throughput +47.7% 보고. |
 | [#20349](https://github.com/sgl-project/sglang/pull/20349) | SGLang | Open | PD-Multiplexing prefill stream용 attn/MoE 통신 그룹 누락으로 illegal memory access가 나던 문제 수정. 분리 stream에서 group 초기화를 명시화. |
 | [#20336](https://github.com/sgl-project/sglang/issues/20336) | SGLang | Open (Bug) | 2노드(각 8xH200) DeepSeek-V3.2에서 DeepEP internode dispatch timeout 및 illegal memory access 보고. |
 | [#20315](https://github.com/sgl-project/sglang/issues/20315) | SGLang | Open (Bug) | TP16/DP16 장시간 서비스 후 전 rank 동시 stall, py-spy dump 이후 watchdog timeout(300s) 발생. |
