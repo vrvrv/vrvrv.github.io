@@ -198,7 +198,15 @@ logits = self.model.compute_logits(sample_hidden_states)
 
 이 데이터를 가지고 `sample_tokens()`는 크게 네 단계를 밟는다: **(1) sampling** → **(2) rejection sampling** → **(3) draft proposal** → **(4) bookkeeping**. 그런데 코드를 읽어보면 (3)과 (4)의 순서가 drafter 종류에 따라 뒤바뀐다.
 
-**Bookkeeping(`_bookkeeping_sync()`)**: sampling 결과를 GPU에서 CPU로 가져와 request별 상태를 최신으로 만드는 작업이다 — `num_computed_tokens`, `all_token_ids` 갱신, output 집계 등. N-gram이나 Suffix Decoding은 이 CPU 측 `all_token_ids`로 패턴 매칭을 하므로 bookkeeping이 먼저 와야 한다. GPU 기반 drafter(Eagle, Medusa 등)는 GPU 텐서를 직접 쓰기 때문에 이 제약이 없고, `_bookkeeping_sync()`의 CUDA sync를 피해 draft를 먼저 실행한다. 항상 bookkeeping을 먼저 해도 동작하지만, vLLM은 불필요한 동기화를 피하는 쪽을 택했다.
+**Bookkeeping(`_bookkeeping_sync()`)이 하는 일**부터 보자. Rejection sampling이 끝나면 "어떤 token이 최종 accept되었는가"를 request별 상태에 반영해야 한다 — GPU에서 sampled token을 CPU로 가져온 뒤(`output_token_ids.cpu().numpy()`), reject된 placeholder를 제거하고, `num_computed_tokens`, `all_token_ids` 갱신, output 집계 등 CPU 측 상태를 최신으로 만든다. 이 과정의 산출물이 `valid_sampled_token_ids` (`list[list[int]]`)다.
+
+**왜 두 경로가 필요한가?** 문제는 이 `valid_sampled_token_ids`의 **생산 경로**에 있다. N-gram proposer는 CPU 메모리의 `token_ids_cpu` 배열에서 패턴 매칭을 하므로, bookkeeping이 GPU→CPU sync를 완료하고 CPU 측 이력을 갱신한 **뒤에야** draft를 생성할 수 있다. 즉 draft의 입력이 bookkeeping의 출력에 의존한다.
+
+반면 Eagle이나 Medusa 같은 GPU 기반 drafter는 `sampler_output.sampled_token_ids` (GPU 텐서)를 그대로 입력으로 받고, rejection 처리도 GPU에서 자체적으로 수행한다 (`prepare_next_token_ids_padded()`). **GPU→CPU sync를 거치지 않는 별도의 데이터 경로**가 있기 때문에 bookkeeping을 기다릴 필요가 없다. 그래서 draft를 먼저 실행한 뒤 bookkeeping을 나중에 처리한다.
+
+"그래도 항상 bookkeeping을 먼저 하면 코드가 단순하지 않은가?" — 맞다. 동작 자체는 문제없다. 하지만 `_bookkeeping_sync()`의 `.cpu().numpy()`는 **blocking CUDA sync**로, pending GPU 연산이 모두 끝날 때까지 CPU가 멈춘다. 이 sync 이전에 draft forward를 먼저 실행하면 sampled token이 GPU→CPU를 거치지 않고 바로 drafter로 들어가므로, draft가 이 sync의 critical path에서 빠진다. 실제로 이 설계를 도입한 [PR #24539](https://github.com/vllm-project/vllm/pull/24539)에서는 이를 "efficient padded speculation"이라 부르며, draft batch를 GPU에서 padded 형태로 직접 처리하도록 변경했다.
+
+이 차이가 정말 유의미한지는 이후 PR이 증명한다. [PR #29184](https://github.com/vllm-project/vllm/pull/29184)에서는 N-gram proposer를 GPU로 재구현(`NgramProposerGPU`)하여 bookkeeping 전에 실행되도록 옮겼고, async scheduling과 결합해 **20-39%의 성능 향상**을 달성했다. 같은 알고리즘이 데이터 경로(CPU vs GPU)만 바꿔도 이 정도 차이가 나는 것이다.
 
 <div style="display: flex; gap: 1.5rem; align-items: flex-start;">
 <div style="flex: 1; min-width: 0;">
@@ -258,17 +266,68 @@ flowchart TD
     RS --> R2["output_token_ids: [batch, max_spec_len+1]"]
 </div>
 
-**Bonus token**: Target model이 draft 위치 **다음** 위치에서 생성하는 token. 모든 draft가 accept되면 이 bonus token이 추가로 출력된다.
+**Bonus token**: Target model이 마지막 draft 위치 **다음** 위치에서 생성하는 token. 모든 draft가 accept되었을 때 추가로 출력된다. Speculative decoding은 항상 **"accepted tokens + 1"**개를 출력하는데, 이 "+1"의 출처가 상황에 따라 다르다: 전부 accept되면 bonus token, 중간에 reject되면 해당 위치의 recovered token이 "+1"에 해당한다. 최악의 경우(첫 position에서 reject)에도 1개는 보장되므로, 일반 autoregressive decoding보다 나빠지지 않는다.
 
-### 3.2 Rejection Sampling 상세
+### 3.2 Rejection Sampling
 
-[Leviathan et al. (2023)](https://arxiv.org/abs/2211.17192)의 알고리즘을 Triton 커널로 구현한다.
+[Leviathan et al. (2023)](https://arxiv.org/abs/2211.17192)의 알고리즘을 Triton 커널로 구현한다. vLLM은 serving engine이므로 `temperature`는 per-request 파라미터다 — 한 batch 안에 `temperature=0`(greedy)과 `temperature>0`(random) request가 섞일 수 있다. 이를 처리하기 위해 **두 개의 Triton 커널을 순차 실행**하되 같은 `output_token_ids` 버퍼에 쓴다. 두 커널이 캐스케이드로 동작하는 것이 아니라, `is_greedy = (temperature == 0)` 마스크로 **request별로 담당 커널이 나뉜다** — 각 커널은 자기 담당이 아닌 request를 skip한다. (전부 greedy이거나 전부 random이면 `all_greedy`/`all_random` 플래그로 커널 하나만 실행한다.)
 
-**Greedy**: target의 argmax와 draft token이 같으면 accept, 다르면 해당 위치에서 target의 argmax를 출력하고 나머지는 버린다. 모든 draft가 accept되면 bonus token 추가.
+`rejection_sample()` 함수의 입력 shape과 전체 흐름:
 
-**Random**: `p_target(x) / p_draft(x) ≥ U(0,1)`이면 accept. Reject 시 `max(p_target - p_draft, 0)`을 정규화한 분포에서 recovered token을 sampling (Gumbel-max trick: `argmax(prob / q)`, q ~ Exp(1)).
+```python
+def rejection_sample(
+    draft_token_ids,       # [N] — 전체 draft token (flattened)
+    num_draft_tokens,      # list[int], len=B — request별 draft 수
+    cu_num_draft_tokens,   # [B] — draft 수의 cumulative sum
+    draft_probs,           # [N, V] or None — draft model 확률 분포
+    target_logits,         # [N, V] — target model logits (draft 위치)
+    bonus_token_ids,       # [B, 1] — bonus token (Sampler에서 사전 생성)
+    # N = sum(num_draft_tokens), B = batch_size, V = vocab_size
+):
+    # output 버퍼: [B, max_spec_len + 1], PLACEHOLDER(-1)로 초기화
+    output_token_ids = full(PLACEHOLDER_TOKEN_ID)
 
-**N-gram 특수 처리**: `draft_probs=None`이면 draft_prob=1로 간주.
+    # ── Greedy rejection ──
+    if not all_random:
+        target_argmax = target_logits.argmax(dim=-1)  # [N]
+        rejection_greedy_sample_kernel(               # grid=(B,)
+            output_token_ids, draft_token_ids,
+            target_argmax, bonus_token_ids, is_greedy)
+        if all_greedy:
+            return output_token_ids
+
+    # ── Random rejection 준비 ──
+    target_probs = target_logits.softmax(dim=-1)      # [N, V]
+    uniform_probs = generate_uniform_probs(...)        # [N], float64
+    recovered_token_ids = sample_recovered_tokens(     # [N]
+        target_probs, draft_probs, draft_token_ids)
+
+    # ── Random rejection 실행 ──
+    rejection_random_sample_kernel(                    # grid=(B,)
+        output_token_ids, draft_token_ids,
+        target_probs, draft_probs, bonus_token_ids,
+        uniform_probs, recovered_token_ids, is_greedy)
+
+    return output_token_ids  # [B, max_spec_len + 1]
+```
+
+각 함수를 좀 더 자세히 보면:
+
+**`rejection_greedy_sample_kernel`**: grid `(B,)`. 각 request에 대해 draft position을 순회하며 매 위치에서 `target_argmax`를 출력한다. `draft_token != target_argmax`이면 그 위치의 target argmax를 마지막으로 출력하고 이후 draft를 모두 버린다 (이 경우 **bonus token은 추가되지 않는다**). 전부 accept된 경우에만 bonus token을 append한다.
+
+**`generate_uniform_probs`**: acceptance 판정에 사용할 uniform random 값을 `[N]` shape으로 생성한다. **float64**를 사용하는데, 이는 PyTorch의 `torch.rand`가 float32에서 정확히 0.0을 반환할 수 있는 [known issue](https://github.com/pytorch/pytorch/issues/16706) 때문이다 — 0.0이 나오면 `p_target / p_draft ≥ 0`이 항상 성립하여 reject가 불가능해진다.
+
+**`sample_recovered_tokens`**: reject 시 출력할 **recovered token을 사전에 계산**한다. Triton 커널을 grid `(B, max_spec_len)`으로 launch하여, 각 (request, position)에 대해 잔차 분포에서 Gumbel-max trick으로 sampling한다 (`argmax(prob * inv_q)`, inv_q = 1/Exp(1)). vocabulary를 `BLOCK_SIZE=8192` 단위로 tiling하며 running max를 유지한다. Rejection 루프 안에서 vocab 전체를 스캔하지 않도록, **미리 계산해두는 것이 핵심 최적화**다.
+
+**`rejection_random_sample_kernel`**: grid `(B,)`. 각 request에 대해 draft position을 순회하며 `p_target[d[i]] / p_draft[d[i]] ≥ uniform_prob`이면 accept(draft token 출력). Reject 시 사전에 계산된 `recovered_token_ids[i]`를 출력하고 이후 draft를 버린다. Greedy와 마찬가지로 전부 accept된 경우에만 bonus token을 append한다.
+
+**Reject 시 왜 bonus token을 추가할 수 없는가?** Target model은 forward pass에서 모든 draft token `d[0..K-1]`이 맞다고 가정하고 한번에 logits을 계산한다. Position i의 logit은 prefix + `d[0..i-1]`을 기반으로 계산되었으므로, `d[0..i-1]`이 모두 accept된 상태에서 position i의 reject/recovery는 유효하다. 하지만 position i+1 이후의 logit은 `d[i]`가 입력이라고 가정하고 계산된 것인데, 실제로는 recovered token(또는 target argmax)이 출력되어 **prefix가 달라졌으므로 후속 logit이 모두 무효**가 된다. Bonus logit 역시 `d[0..K-1]` 전체를 가정하고 계산되었으므로, 하나라도 reject되면 사용할 수 없다.
+
+**Recovery란?** Draft가 reject되면 그 위치에서 어떤 token을 출력해야 할까. 단순히 target 분포에서 다시 sampling하면, accept 확률이 높았던 token(= draft와 target이 비슷한 token)이 과대 대표된다 — accept 경로에서도 출력되고, reject 후 재sampling에서도 뽑힐 수 있기 때문이다. 잔차 분포 `max(p_target - p_draft, 0)`은 "target이 원하지만 draft가 충분히 커버하지 못한 token"에 확률을 몰아주어, accept 경로와 합쳤을 때 정확히 target 분포를 복원한다.
+
+**v0.17.1에서 `draft_probs`는 항상 `None`**: 원래 알고리즘의 acceptance 기준과 recovery 분포에는 draft model이 **각 speculative 위치에서 전체 vocabulary에 대해 계산한 확률 분포**가 필요하다. 즉 `[num_reqs, num_spec_tokens, vocab_size]` 크기의 draft logits 텐서를 저장해야 한다. vocab_size가 128k인 모델에서 spec token 5개, batch 256이면 이것만으로 ~320MB(fp16)다. v0.17.1에서는 이 비용을 피하기 위해 **모든 drafter 종류에 대해** `draft_probs=None`을 하드코딩한다. 이 경우 Triton 커널은 `draft_prob=1`로 간주하여, acceptance 기준이 `p_target(x) ≥ U(0,1)`로 단순화되고, recovery 시에도 draft token을 제외한 target 분포에서 바로 sampling한다. Target 분포를 엄밀하게 보존하지는 않는 근사적 방식이지만, draft logits 캐싱이 불필요하여 메모리 효율적이다.
+
+Rejection sampling의 커널 구현과 확률적 보장에 대해서는 [3편](/2026-03-22-speculative-decoding-3.html)에서 자세히 다룬다.
 
 **Output**: `[batch_size, max_spec_len + 1]` — reject된 slot은 `PLACEHOLDER_TOKEN_ID = -1`. `parse_output()`에서 placeholder 제거.
 
