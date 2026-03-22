@@ -72,8 +72,11 @@ table, th, td {
 }
 
 code {
-  color: white;
-  background: black;
+  color: black;
+  background: #f0f0f0;
+  padding: 0.15em 0.35em;
+  border-radius: 3px;
+  font-size: 0.9em;
 }
 
 div.highlighter-rouge code {
@@ -81,6 +84,43 @@ div.highlighter-rouge code {
   overflow-x: auto;
   white-space: pre-wrap;
   padding: 1rem;
+  color: #f8f8f2;
+  background: #272822;
+  border-radius: 4px;
+  font-size: 0.82em;
+}
+
+// Rouge syntax highlighting — Monokai
+.highlight {
+  .hll { background-color: #49483e }
+  .c, .cm, .cp, .c1, .cs { color: #75715e } // comments
+  .k, .kc, .kd, .kn, .kp, .kr { color: #66d9ef } // keywords
+  .kt { color: #66d9ef } // keyword type
+  .kv { color: #66d9ef }
+  .o, .ow { color: #f92672 } // operators
+  .p { color: #f8f8f2 } // punctuation
+  .n { color: #f8f8f2 } // names
+  .na { color: #a6e22e } // name attribute
+  .nb { color: #f8f8f2 } // name builtin
+  .nc { color: #a6e22e } // name class
+  .nd { color: #a6e22e } // name decorator
+  .nf, .fm { color: #a6e22e } // name function
+  .ni { color: #f8f8f2 }
+  .nn { color: #f8f8f2 } // name namespace
+  .no { color: #66d9ef } // name constant
+  .nt { color: #f92672 } // name tag
+  .nv, .vi, .vg, .vc { color: #f8f8f2 } // name variable
+  .bp { color: #f8f8f2 } // name builtin pseudo
+  .s, .sa, .sb, .sc, .dl, .sd, .sh, .s2, .s1, .se, .si, .sx, .sr, .ss { color: #e6db74 } // strings
+  .m, .mb, .mf, .mh, .mi, .mo, .il { color: #ae81ff } // numbers
+  .l { color: #ae81ff } // literal
+  .err { color: #960050; background-color: #1e0010 } // error
+  .gd { color: #f92672 } // diff deleted
+  .gi { color: #a6e22e } // diff inserted
+  .ge { font-style: italic }
+  .gs { font-weight: bold }
+  .gu { color: #75715e } // diff hunk
+  .w { color: #f8f8f2 } // whitespace
 }
 
 blockquote {
