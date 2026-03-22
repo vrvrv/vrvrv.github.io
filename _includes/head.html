@@ -39,6 +39,61 @@
     .mermaid svg { max-height: 600px; }
     .mermaid-wide { font-size: 13px; overflow-x: auto; }
     .mermaid-wide svg { max-height: none; width: 100%; }
+
+    /* Floating TOC */
+    .floating-toc {
+      position: fixed;
+      top: 2rem;
+      right: 1rem;
+      max-width: 260px;
+      max-height: calc(100vh - 4rem);
+      overflow-y: auto;
+      font-size: 0.75em;
+      line-height: 1.5;
+      z-index: 100;
+      padding: 0.8rem;
+      border-left: 2px solid #ddd;
+    }
+    .floating-toc ul { list-style: none; padding: 0; margin: 0; }
+    .floating-toc li { margin: 0.2rem 0; }
+    .floating-toc li.toc-h3 { padding-left: 0.8rem; }
+    .floating-toc li.toc-h4 { padding-left: 1.6rem; }
+    .floating-toc a { color: #888; text-decoration: none; }
+    .floating-toc a:hover { color: #333; }
+    .floating-toc a.active { color: #000; font-weight: bold; }
+    @media (max-width: 1200px) { .floating-toc { display: none; } }
   </style>
+  <script>
+    document.addEventListener('DOMContentLoaded', function() {
+      const headings = document.querySelectorAll('h2[id], h3[id], h4[id]');
+      if (headings.length === 0) return;
+      const toc = document.createElement('nav');
+      toc.className = 'floating-toc';
+      const ul = document.createElement('ul');
+      headings.forEach(function(h) {
+        const li = document.createElement('li');
+        li.className = 'toc-' + h.tagName.toLowerCase();
+        const a = document.createElement('a');
+        a.href = '#' + h.id;
+        a.textContent = h.textContent.replace(/^[\d.]+\s*/, '').substring(0, 40);
+        li.appendChild(a);
+        ul.appendChild(li);
+      });
+      toc.appendChild(ul);
+      document.body.appendChild(toc);
+
+      const links = toc.querySelectorAll('a');
+      const observer = new IntersectionObserver(function(entries) {
+        entries.forEach(function(entry) {
+          if (entry.isIntersecting) {
+            links.forEach(function(l) { l.classList.remove('active'); });
+            const active = toc.querySelector('a[href="#' + entry.target.id + '"]');
+            if (active) active.classList.add('active');
+          }
+        });
+      }, { rootMargin: '0px 0px -70% 0px', threshold: 0 });
+      headings.forEach(function(h) { observer.observe(h); });
+    });
+  </script>
 
 </head>
