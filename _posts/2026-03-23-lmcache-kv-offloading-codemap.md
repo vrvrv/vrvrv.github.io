@@ -6,26 +6,28 @@ category: llm-serving
 
 > **Note**: 이 포스트는 [vLLM v0.17.1](https://github.com/vllm-project/vllm/tree/v0.17.1) 기준으로 작성되었습니다. 이후 버전에서 API나 내부 구조가 변경되었을 수 있습니다.
 
-70B 모델을 A100 80GB에서 서빙한다고 하자. FP16 파라미터에 ~35GB, activation과 CUDA context에 ~5GB. KV cache에 쓸 수 있는 GPU 메모리는 ~40GB인데, 긴 context가 몇 개만 들어와도 이 40GB는 순식간에 찬다. 이때 선택지는 세 가지다 — preemption으로 요청을 쫓아내거나(TTFT 폭증), 더 비싼 GPU를 쓰거나(비용 폭증), KV cache를 GPU 밖으로 빼거나.
+Llama 3 70B로 128K context를 서빙하면, 요청 **하나**의 KV cache가 [~40GB를 차지한다](https://developer.nvidia.com/blog/accelerate-large-scale-llm-inference-and-kv-cache-offload-with-cpu-gpu-memory-sharing/). H100 80GB에서 모델 파라미터를 빼면 요청 1개만으로 GPU가 거의 찬다. 요청이 조금만 쌓여도 preemption이 발생하고, preempt된 128K 요청은 처음부터 KV를 recompute해야 한다.
 
-세 번째 선택지가 KV cache offloading이다. 개념은 직관적이다. 당장 attention에 참여하지 않는 KV를 CPU DRAM이나 disk로 내려놓고, 다시 필요할 때 올린다. 그런데 이걸 serving engine에 실제로 구현하려면 즉시 부딪히는 문제가 있다: **granularity mismatch**. vLLM의 paged KV buffer는 16-token 블록 단위로 GPU 메모리를 관리하는 반면, LMCache는 256-token chunk 단위로 외부 storage를 관리한다. Scheduler가 "이 prefix는 외부 cache에 있다"고 판단해서 블록을 할당해도, worker가 실제로 KV를 꺼내오려면 chunk 경계에 맞춰 token mask를 만들어야 한다.
+해결책은 직관적이다 — KV cache를 CPU DRAM이나 disk로 내려놓고, 다시 필요하면 올린다. vLLM의 [KV offloading connector 벤치마크](https://vllm.ai/blog/kv-offloading-connector)에서는 이 방식으로 **TTFT 2~22x 감소, throughput 최대 9x 향상**을 달성했다.
 
-더 흥미로운 문제는 timing이다. KV cache를 CPU에서 GPU로 올리는 건 PCIe bandwidth에 묶인 느린 작업이다. Naive하게 forward pass 전에 모든 레이어의 KV를 한번에 올리면, 그 시간 동안 GPU compute는 놀게 된다. 하지만 LLM은 layer 0, 1, 2, ... 순서대로 KV에 접근한다는 걸 우리는 **사전에** 안다. 이 예측 가능성을 이용하면 "layer N의 attention 연산"과 "layer N+1의 KV transfer"를 overlap시킬 수 있다 — LMCache의 layerwise pipelining이 정확히 이걸 한다.
+그런데 코드를 들여다보면 생각보다 단순하지 않다. Scheduler가 "이 요청의 prefix가 CPU에 있다"는 걸 어떻게 아는가? vLLM은 16-token block 단위로 GPU를 관리하는데 LMCache는 256-token chunk 단위다 — 이 **granularity mismatch**는 어떻게 처리하는가? Forward pass 중에 레이어별로 KV를 load하면 GPU는 PCIe 전송을 기다리느라 놀지 않는가? `save_kv_layer()`는 정말 매번 실행되는가, 아니면 skip 조건이 있는가?
 
-이 포스트는 vLLM 0.17.1의 LMCache connector 코드를 multi-tiered KV cache offloading 관점에서 추적한다. Scheduler의 2-phase cache lookup에서 시작해서, worker의 레이어별 KV load/save까지, 실행 흐름을 코드 레벨에서 따라간다.
+이 포스트는 vLLM의 LMCache connector 코드를 multi-tiered KV cache offloading 관점에서 추적하며, 이런 질문들에 답한다. Scheduler의 2-phase cache lookup에서 시작해서, LMCacheEngine 내부의 CUDA kernel까지 따라간다.
+
+---
 
 * toc
 {:toc}
 
 ---
 
-## 1. vLLM KV Cache 관리: Baseline
+## 1. vLLM KV Cache 관리
 
 LMCache가 어디에 끼어드는지를 이해하려면, 먼저 vLLM이 KV cache를 어떻게 관리하는지 알아야 한다.
 
 ### 1.1 Paged KV Buffer
 
-vLLM은 서버 시작 시 GPU에 고정 크기의 paged KV buffer를 pre-allocate한다. 이 buffer는 `block_size`(기본 16) 토큰 단위의 physical block 배열이다. 각 physical block은 모든 레이어의 K, V 텐서를 담는다.
+vLLM은 서버 시작 시 GPU에 고정 크기의 paged KV buffer를 pre-allocate한다. 이 buffer는 `block_size`(기본 16) 토큰 단위의 physical block 배열이다. **레이어마다 별도의 KV cache 텐서**가 할당되며, 같은 `block_id`가 모든 레이어에서 공유된다 (block table은 하나, 물리 메모리는 레이어별).
 
 요청이 들어오면 `KVCacheManager`가 필요한 physical block을 할당하고, **block_table**(logical block → physical block 매핑)을 관리한다. 같은 prefix를 공유하는 요청들은 physical block을 공유할 수 있다(prefix caching).
 
@@ -71,7 +73,7 @@ flowchart LR
 </div>
 
 > 파랑 = prefix 공유 block (ref_count=2), 주황 = Req A 전용, 회색 = free. 점선 = 공유 참조.
-> 각 physical block shape: `[num_layers, 2(K,V), block_size, num_kv_heads, head_dim]`
+> 각 레이어의 KV cache shape: `[2(K,V), num_blocks, block_size, num_kv_heads, head_dim]` — 레이어마다 별도 텐서, block_id는 공유.
 
 ### 1.2 Scheduler의 스케줄링 사이클
 
@@ -178,7 +180,7 @@ Baseline에서 scheduler는 GPU prefix cache만 확인했다 (1-phase lookup). L
 
 **확장 ②: Worker에서 매 forward pass마다 KV를 외부로 저장**
 
-이것이 핵심 설계 결정이다. LMCache가 있으면 worker는 **매번** 새로 계산한 KV를 CPU/disk에 저장한다. Preemption이 발생하든 안 하든 관계없이, 모든 forward pass 결과가 외부에 남는다 — **write-through cache** 모델.
+이것이 핵심 설계 결정이다. LMCache가 있으면 worker는 새로 계산한 KV를 CPU/disk에 저장한다 — **proactive save** 모델. 단, 모든 forward pass에서 무조건 실행되는 것은 아니다. `SaveSpec.can_save`가 다음 조건 중 하나라도 해당하면 skip된다: chunk 경계에 도달하지 못한 경우, decode phase에서 `save_decode_cache=False`인 경우, per-request `skip_save` 플래그가 설정된 경우. 그럼에도 prefill phase에서 chunk 경계를 넘는 대부분의 경우에는 저장이 실행되므로, preemption 복구에 충분한 KV가 외부에 남는다.
 
 이 두 확장이 합쳐지면 preemption 문제가 해결된다:
 
@@ -232,7 +234,7 @@ Baseline에서는 **preemption = KV 유실 = recompute**였다. LMCache에서는
 
 ### 1.6 흔한 오해: "GPU에서 evict할 때 CPU로 내리는 것 아닌가?"
 
-KV cache offloading이라는 이름을 들으면, OS의 swap처럼 "GPU 메모리가 부족할 때 block을 CPU로 내리고, 다시 필요하면 올린다"는 그림을 떠올리기 쉽다. 하지만 **LMCache는 그렇게 동작하지 않는다.**
+KV cache offloading이라는 이름을 들으면, OS의 swap처럼 "GPU 메모리가 부족할 때 block을 CPU로 내리고, 다시 필요하면 올린다"는 그림을 떠올리기 쉽다. 하지만 **LMCache도 OffloadingConnector도 그렇게 동작하지 않는다** — 둘 다 메모리 압박과 무관하게 proactive하게 저장한다.
 
 <div class="mermaid-wide">
 flowchart LR
@@ -241,9 +243,9 @@ flowchart LR
         W1["GPU block 부족"] --> W2["evict 대상 선택"] --> W3["GPU → CPU 복사"] --> W4["GPU block 해제"]
     end
 
-    subgraph right["LMCache 실제 동작 (write-through 모델)"]
+    subgraph right["실제 동작 (proactive 모델)"]
         direction LR
-        R1["forward pass 완료"] --> R2["save_kv_layer():<br/>GPU → CPU 복사<br/>(매번, 무조건)"] --> R3["... 시간 경과 ..."] --> R4["GPU block 부족<br/>→ LRU evict<br/>→ GPU block 해제<br/>(CPU 복사 없음)"]
+        R1["forward pass 완료<br/>or scheduler step"] --> R2["GPU → CPU 복사<br/>(block/chunk 완성 시)"] --> R3["... 시간 경과 ..."] --> R4["GPU block 부족<br/>→ LRU evict<br/>→ GPU block 해제<br/>(CPU 복사 불필요)"]
     end
 
     style W3 fill:#c0392b,stroke:#333,color:#fff
@@ -253,11 +255,12 @@ flowchart LR
 
 차이를 정리하면:
 
-| | OS swap / OffloadingConnector | LMCache |
+| | OffloadingConnector | LMCache |
 |---|---|---|
-| **저장 시점** | GPU block을 evict할 때 (reactive) | 매 forward pass에서 (proactive) |
-| **evict 시 동작** | GPU → CPU 복사 후 GPU 해제 | GPU 해제만 (이미 CPU에 있음) |
-| **CPU에도 없는 경우** | 해당 없음 (evict 시 항상 복사) | recompute fallback |
+| **저장 시점** | 매 scheduler step에서 완성된 block을 offload (proactive) | 매 forward pass에서 chunk 경계 도달 시 offload (proactive) |
+| **저장 단위** | vLLM block (16 tok), cross-layer layout | LMCache chunk (256 tok), per-layer |
+| **evict 시 동작** | CPU에 이미 있으므로 GPU만 해제 | CPU에 이미 있으므로 GPU만 해제 |
+| **CPU에도 없는 경우** | LRU/ARC eviction으로 유실 가능 → recompute | LRU eviction으로 유실 가능 → [`kv_load_failure_policy`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/config/kv_transfer.py)로 제어 (기본값: `"fail"`) |
 
 **그런데 CPU 메모리도 유한하다.** `save_kv_layer()`가 매번 KV를 CPU에 쓰면, 언젠가 LMCache가 할당받은 CPU 메모리(`max_local_cpu_size`)도 가득 찬다. 이때 LMCache 자체의 LRU eviction이 발생한다 — 오래된 chunk를 버리고 새 chunk를 저장한다.
 
@@ -288,7 +291,7 @@ sequenceDiagram
 
 1. **GPU의 eviction 대상은 prefix cache의 재사용 대기 block**이다 — 현재 실행 중인 요청의 block은 active reference가 있어 절대 evict되지 않는다.
 2. **CPU의 eviction 대상은 LMCache의 가장 오래된 chunk**이다 — `save_kv_layer()`로 새 chunk를 저장할 때 공간이 부족하면 LRU chunk를 버린다.
-3. **양쪽 다 없으면 recompute로 fallback한다** — GPU miss + LMCache miss이면 `num_computed_tokens = 0`이 되어 baseline과 동일하게 전체 recompute한다. [`kv_load_failure_policy`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/config/kv_transfer.py)가 이 경로를 제어한다 ([PR #26813](https://github.com/vllm-project/vllm/pull/26813)).
+3. **양쪽 다 없으면 fallback한다** — GPU miss + LMCache miss이면 [`kv_load_failure_policy`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/config/kv_transfer.py) ([PR #26813](https://github.com/vllm-project/vllm/pull/26813))에 따라 동작이 결정된다. 기본값은 `"fail"`(요청 즉시 실패)이며, `"recompute"`로 설정하면 처음부터 다시 계산한다.
 
 즉 LMCache는 **best-effort cache**다. 두 계층(GPU prefix cache, LMCache CPU/disk) 간에 inclusive/exclusive 보장 같은 건 없고, 각자 독립적으로 eviction을 수행한다. `max_local_cpu_size`를 충분히 크게 잡으면 CPU eviction 빈도는 낮아지지만, 완전히 없앨 수는 없다.
 
@@ -303,7 +306,7 @@ sequenceDiagram
 | **해싱 단위** | `block_size` (16 tokens) | `chunk_size` (256 tokens) |
 | **해시 알고리즘** | SHA-256/xxhash (CBOR 직렬화) | 자체 prefix-hash chain |
 | **해시 체인** | `hash(block_i) = hash(parent_hash, token_ids, extra_keys)` | `hash(chunk_i) = hash(parent_hash, chunk_tokens)` |
-| **해시 시드** | `NONE_HASH` (프로세스별 랜덤) | deterministic (cross-instance 공유 가능) |
+| **해시 시드** | `NONE_HASH` (기본: `os.urandom(32)`로 프로세스별 랜덤. `PYTHONHASHSEED` 설정 시 deterministic) | deterministic (cross-instance 공유 가능) |
 | **저장 위치** | `BlockPool.cached_block_hash_to_block` (in-memory dict) | `StorageManager` backends (CPU/disk/remote) |
 
 vLLM의 APC는 16-token block 단위로 해시를 체이닝하고, LMCache는 256-token chunk 단위로 독립적인 해시를 체이닝한다. 같은 prefix라도 해시값 자체는 다르다.
@@ -343,7 +346,7 @@ LMCache가 외부에서 load한 KV가 GPU block에 채워지면, 그 block들은
 
 ---
 
-## 2. KVConnectorBase_V1: 추상 인터페이스
+## 2. LMCache KV Connector: 인터페이스와 구현
 
 [`KVConnectorBase_V1`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/distributed/kv_transfer/kv_connector/v1/base.py)은 vLLM의 **KV cache 이동**을 위한 통합 추상 클래스다 ([PR #15960](https://github.com/vllm-project/vllm/pull/15960)). 이 인터페이스는 두 가지 용도를 동시에 지원한다:
 
@@ -387,99 +390,7 @@ flowchart LR
     style Worker fill:#fdf2e9,stroke:#e67e22
 </div>
 
-### 2.1 Scheduler-side 메서드
-
-```python
-# 외부 KV cache에서 hit되는 토큰 수 조회
-def get_num_new_matched_tokens(
-    self, request: Request, num_computed_tokens: int
-) -> tuple[int | None, bool]:
-    # Returns: (매칭 토큰 수 or None, async 로딩 여부)
-
-# 블록 할당 후 connector 상태 업데이트
-def update_state_after_alloc(
-    self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
-):
-
-# 현재 step의 connector metadata 생성 (worker에게 전달)
-def build_connector_meta(
-    self, scheduler_output: SchedulerOutput
-) -> KVConnectorMetadata:
-
-# 요청 완료 시 호출 — 블록 해제 또는 비동기 전송 결정
-def request_finished(
-    self, request: Request, block_ids: list[int]
-) -> tuple[bool, dict | None]:
-
-# KV cache event 발행 (llm-d 등 외부 시스템용)
-def take_events(self) -> Iterable[KVCacheEvent]:
-```
-
-### 2.2 Worker-side 메서드
-
-```python
-# KV cache 텐서 등록 (1회)
-def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-
-# 비동기 KV 로딩 시작 (forward pass 전)
-def start_load_kv(self, forward_context: ForwardContext, **kwargs):
-
-# 특정 레이어 로딩 완료 대기 (attention layer 내부)
-def wait_for_layer_load(self, layer_name: str):
-
-# 특정 레이어 KV 저장 (attention layer 내부)
-def save_kv_layer(self, layer_name: str, kv_layer, attn_metadata, **kwargs):
-
-# 모든 저장 완료 대기 (forward pass 후)
-def wait_for_save(self):
-
-# 비동기 전송 완료된 요청 ID 반환
-def get_finished(self, finished_req_ids: set[str]) -> tuple[set | None, set | None]:
-```
-
----
-
-## 3. LMCacheConnectorV1Impl: Core 구현 ([source](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py), [PR #25542](https://github.com/vllm-project/vllm/pull/25542))
-
-### 3.1 주요 데이터 구조
-
-```python
-# vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py
-
-@dataclass
-class LoadSpec:
-    vllm_cached_tokens: int        # vLLM local prefix cache에서 hit된 토큰 수
-    lmcache_cached_tokens: int     # LMCache에서 hit된 토큰 수 (local 포함)
-    can_load: bool = False         # 블록 할당 완료 후 True
-
-@dataclass
-class SaveSpec:
-    skip_leading_tokens: int       # 이미 저장된 토큰 수 (skip할 prefix)
-    can_save: bool = True          # 저장 실행 여부
-
-@dataclass
-class RequestTracker:
-    req_id: str
-    prompt_len: int
-    token_ids: list[int]           # 현재까지의 토큰 ID
-    allocated_block_ids: list[int] # 할당된 vLLM 블록 ID
-    num_saved_tokens: int          # LMCache에 저장 완료된 토큰 수
-    mm_hashes: list[str] | None    # multimodal hash
-    mm_positions: list | None
-    skip_save: bool = False
-    is_decode_phase: bool = False
-
-@dataclass
-class ReqMeta:
-    req_id: str
-    token_ids: list[int]
-    slot_mapping: torch.Tensor     # vLLM paged KV buffer의 slot mapping
-    is_last_prefill: bool = False
-    save_spec: SaveSpec | None = None
-    load_spec: LoadSpec | None = None
-```
-
-### 3.2 초기화 (Scheduler vs Worker)
+이 추상 인터페이스를 LMCache가 구현한 것이 [`LMCacheConnectorV1Impl`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_integration/vllm_v1_adapter.py) ([PR #25542](https://github.com/vllm-project/vllm/pull/25542))이다. 하나의 클래스가 `KVConnectorRole`에 따라 scheduler와 worker에서 **완전히 다른 컴포넌트**를 초기화한다:
 
 ```python
 class LMCacheConnectorV1Impl:
@@ -491,18 +402,27 @@ class LMCacheConnectorV1Impl:
                 _validate_and_set_config_value(config, key[8:], value)
 
         if role == KVConnectorRole.SCHEDULER:
-            # LookupClient 생성 — token hash 기반 외부 캐시 조회
+            # LookupClient만 생성 — 데이터를 옮기지 않고 hit 수만 조회
             self.lookup_client = LookupClientFactory.create_lookup_client(...)
         else:
-            # Worker-side: LMCacheEngine + LookupServer + ZMQOffloadServer
+            # Worker-side: 실제 KV 데이터를 다루는 heavy 컴포넌트들
             self.lmcache_engine = _init_lmcache_engine(config, vllm_config)
             self.lookup_server = LookupClientFactory.create_lookup_server(...)
             self.offload_server = ZMQOffloadServer(...)
 ```
 
+**Scheduler 프로세스**에서는 `LookupClient`만 생성한다. 이 client는 ZMQ를 통해 worker의 `LookupServer`에 "이 token sequence의 KV가 외부에 있는가?"를 물어보고, hit된 토큰 수만 반환받는다. 실제 KV 데이터는 건드리지 않으므로 가벼운 RPC 호출이다.
+
+**Worker 프로세스**에서는 세 가지를 생성한다:
+- **`LMCacheEngine`** — store/retrieve의 핵심. GPU ↔ CPU/disk 간 실제 KV 데이터를 이동시키는 엔진 (섹션 5에서 상세 설명)
+- **`LookupServer`** — scheduler의 LookupClient로부터 ZMQ 요청을 받아 `lmcache_engine.lookup()`을 호출하는 daemon
+- **`ZMQOffloadServer`** — vLLM의 multi-process worker 아키텍처에서, LMCacheEngine에 직접 접근할 수 없는 다른 프로세스의 store 요청을 중계
+
+이 분리 덕분에 scheduler는 외부 cache hit 정보만 빠르게 얻어 스케줄링 결정을 내리고, 실제 데이터 이동은 worker에서 비동기로 처리된다.
+
 ---
 
-## 4. 실행 흐름: Scheduler Side ([`scheduler.py`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/v1/core/sched/scheduler.py))
+## 3. 실행 흐름: Scheduler Side
 
 <div class="mermaid-wide">
 flowchart LR
@@ -518,7 +438,7 @@ flowchart LR
     style H fill:#27ae60,stroke:#333,color:#fff
 </div>
 
-### 4.1 Connector 생성
+### 3.1 Connector 생성
 
 ```python
 # vllm/v1/core/sched/scheduler.py:119-131 (source)
@@ -529,33 +449,52 @@ self.connector = KVConnectorFactory.create_connector(
 )
 ```
 
-### 4.2 요청 스케줄링 — 2단계 prefix cache 조회
+### 3.2 요청 스케줄링 — 2단계 prefix cache 조회
+
+Scheduler는 매 스케줄링 사이클에서 "이 요청의 토큰 중 KV가 이미 어딘가에 존재하는 부분은 어디까지인가?"를 파악해야 한다. KV connector가 없으면 GPU local prefix cache만 확인하지만, LMCache가 있으면 **2단계로 조회**한다.
+
+**Step 1: GPU local prefix cache 조회**
 
 ```python
-# vllm/v1/core/sched/scheduler.py:596-640
-
-# Step 1: vLLM local prefix cache 조회
+# vllm/v1/core/sched/scheduler.py:602-604
 new_computed_blocks, num_new_local_computed_tokens = (
     self.kv_cache_manager.get_computed_blocks(request)
 )
+```
 
-# Step 2: LMCache 외부 캐시 조회
+`KVCacheManager`가 request의 token hash chain을 순차 탐색하여, GPU에 이미 KV가 존재하는 physical block들을 찾는다. 예를 들어 1000 토큰 요청에서 앞 200 토큰의 block이 GPU prefix cache에 있으면 `num_new_local_computed_tokens = 200`을 반환한다. 이 block들은 이후 `allocate_slots()`에서 ref_count를 올려 재사용된다.
+
+**Step 2: LMCache 외부 cache 조회**
+
+```python
+# vllm/v1/core/sched/scheduler.py:607-612
 ext_tokens, load_kv_async = (
     self.connector.get_num_new_matched_tokens(
         request, num_new_local_computed_tokens
     )
 )
-
-# 합산
-num_computed_tokens = num_new_local_computed_tokens + ext_tokens
 ```
 
-`get_num_new_matched_tokens` 내부에서는:
-1. token ID에 multimodal hash 적용
-2. `self.lookup_client.lookup(token_ids, ...)` 호출 — LMCache backend(CPU/disk/remote)에서 연속 prefix 매칭
-3. `LoadSpec(vllm_cached_tokens, lmcache_cached_tokens, can_load=False)` 저장
+두 번째 반환값 `load_kv_async`는 **P/D disaggregation**을 위한 플래그다 ([`base.py` docstring](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L417-L450)). P/D 구조에서는 prefill instance가 계산한 KV를 네트워크를 통해 decode instance로 전송하는데, 이 전송이 완료되기까지 여러 step이 걸릴 수 있다. **Decode instance의 scheduler**가 이 플래그를 보고 "KV가 아직 도착하지 않았으니 forward pass를 하지 말라"고 판단한다 — `num_new_tokens = 0`으로 설정하여 블록만 할당해두고, KV 수신이 완료된 다음 사이클에서 decode를 시작한다. LMCache의 로컬 offloading에서는 CPU → GPU load가 같은 step의 `start_load_kv()`에서 완료되므로 항상 `False`를 반환한다.
 
-### 4.3 블록 할당 후 상태 업데이트
+Connector는 local hit 수를 받아서, LMCache에 **추가로** 얼마나 더 있는지를 조회한다. 내부적으로 `LookupClient` → ZMQ → `LookupServer` → `LMCacheEngine.lookup()` 경로로 CPU/disk/remote backend의 `batched_contains()`를 호출한다. LMCache가 token 0-700까지 보유하고 있으면 `num_external_hit = 700`이지만, local에 이미 200이 있으므로 `ext_tokens = 700 - 200 = 500`만 반환한다 (섹션 1.7의 겹침 방지 로직).
+
+**합산: 무엇을 계산하고 무엇을 건너뛸 것인가**
+
+```python
+# vllm/v1/core/sched/scheduler.py:631-639
+num_computed_tokens = num_new_local_computed_tokens + ext_tokens
+# 200 (GPU) + 500 (LMCache) = 700
+# → 나머지 300 토큰만 forward pass에서 계산
+```
+
+| 구간 | 토큰 수 | KV 출처 | GPU block |
+|------|---------|---------|-----------|
+| 0 - 199 | 200 | GPU prefix cache (이미 있음) | 기존 block 재사용 |
+| 200 - 699 | 500 | LMCache (CPU/disk) | 빈 block 새로 할당 → `start_load_kv()`가 채움 |
+| 700 - 999 | 300 | 없음 → forward pass 계산 | 빈 block 새로 할당 → attention에서 write |
+
+### 3.3 블록 할당 후 상태 업데이트
 
 ```python
 # vllm/v1/core/sched/scheduler.py:746-749
@@ -566,9 +505,9 @@ self.connector.update_state_after_alloc(
 )
 ```
 
-`update_state_after_alloc` 내부에서 `LoadSpec.can_load = True`로 전환.
+`allocate_slots()` 이후에 호출된다. 이 시점에서 LMCache가 채울 500개 토큰분의 빈 GPU block이 확보되었으므로, connector는 `LoadSpec.can_load = True`로 전환한다. 이 플래그가 True여야 worker가 실제로 `start_load_kv()`를 실행한다 — GPU에 넣을 자리가 생기기 전에는 load를 시작할 수 없기 때문이다.
 
-### 4.4 Connector Metadata 빌드
+### 3.4 Connector Metadata 빌드
 
 ```python
 # vllm/v1/core/sched/scheduler.py:898-901
@@ -576,12 +515,9 @@ meta = self.connector.build_connector_meta(scheduler_output)
 scheduler_output.kv_connector_metadata = meta
 ```
 
-`build_connector_meta` 내부에서:
-1. 새 요청 → `RequestTracker` 생성 → `ReqMeta` 생성 (LoadSpec/SaveSpec 포함)
-2. 기존 요청 → `RequestTracker.update()` → 필요시 `ReqMeta` 생성
-3. `LMCacheConnectorMetadata(requests=[...])` 반환
+Scheduler가 결정한 load/save 정보를 `KVConnectorMetadata`로 패키징하여 `SchedulerOutput`에 담는다. 이 metadata가 worker에 전달되면, worker는 "어떤 요청의 어떤 토큰을 load할지, 어떤 토큰을 save할지"를 알 수 있다.
 
-`ReqMeta.from_request_tracker`에서 SaveSpec 결정 로직:
+Save 여부는 다음 조건으로 결정된다:
 
 ```python
 skip_save = (
@@ -592,11 +528,15 @@ skip_save = (
 )
 ```
 
+chunk 경계(256 토큰 배수)에 도달하지 못한 경우나 decode phase에서는 save가 skip된다.
+
 ---
 
-## 5. 실행 흐름: Worker Side
+## 4. 실행 흐름: Worker Side
 
-### 5.1 Connector 초기화 ([`kv_transfer_state.py`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/distributed/kv_transfer/kv_transfer_state.py))
+### 4.1 Connector 초기화
+
+Worker 시작 시 [`kv_transfer_state.py`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/distributed/kv_transfer/kv_transfer_state.py)에서 global singleton으로 connector를 초기화한다:
 
 ```python
 # kv_transfer_state.py:59-73
@@ -611,9 +551,9 @@ def ensure_kv_transfer_initialized(vllm_config, kv_cache_config=None):
         )
 ```
 
-### 5.2 Forward Pass Lifecycle ([PR #21980](https://github.com/vllm-project/vllm/pull/21980))
+### 4.2 Forward Pass Lifecycle
 
-[`KVConnectorModelRunnerMixin._get_kv_connector_output`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/v1/worker/kv_connector_model_runner_mixin.py)가 전체 lifecycle을 관리한다:
+[`KVConnectorModelRunnerMixin._get_kv_connector_output`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/v1/worker/kv_connector_model_runner_mixin.py) ([PR #21980](https://github.com/vllm-project/vllm/pull/21980))가 전체 lifecycle을 관리한다:
 
 <div class="mermaid-wide">
 flowchart LR
@@ -654,46 +594,7 @@ def _get_kv_connector_output(scheduler_output, wait_for_save=True):
         kv_connector.clear_connector_metadata()
 ```
 
-### 5.3 Attention Layer 내부: @maybe_transfer_kv_layer ([PR #27816](https://github.com/vllm-project/vllm/pull/27816))
-
-<div class="mermaid-wide">
-flowchart LR
-    A["unified_attention()"] --> B{"kv_transfer_group?"}
-    B -- No --> C["attention만 실행"]
-    B -- Yes --> D["wait_for_layer_load"]
-    D --> E["attention 연산"]
-    E --> F["save_kv_layer"]
-
-    style D fill:#e67e22,stroke:#333,color:#fff
-    style E fill:#27ae60,stroke:#333,color:#fff
-    style F fill:#4a90d9,stroke:#333,color:#fff
-</div>
-
-```python
-# kv_transfer_utils.py (source)
-def maybe_transfer_kv_layer(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-            return func(*args, **kwargs)
-
-        layer_name = args[layer_name_index]
-        attn_metadata, _, kv_cache, _ = get_attention_context(layer_name)
-        connector = get_kv_transfer_group()
-
-        connector.wait_for_layer_load(layer_name)   # 이 레이어 KV 로딩 완료 대기
-        result = func(*args, **kwargs)               # attention 연산
-        connector.save_kv_layer(layer_name, kv_cache, attn_metadata)  # KV 저장
-        return result
-    return wrapper
-```
-
-이 decorator가 적용된 함수들:
-- `unified_attention()` — attention.py:615
-- `unified_attention_with_output()` — attention.py:685
-- MLA attention의 `mla_unified_attention()` 등 — mla_attention.py:834, 921
-
-### 5.4 start_load_kv 상세
+### 4.3 start_load_kv 상세
 
 ```python
 def start_load_kv(self, forward_context, **kwargs):
@@ -728,7 +629,30 @@ def start_load_kv(self, forward_context, **kwargs):
             )
 ```
 
-### 5.5 wait_for_save 상세 (non-layerwise)
+### 4.4 wait_for_save 상세 (non-layerwise)
+
+`wait_for_save()`는 섹션 4.2의 `_get_kv_connector_output` context manager의 `finally` 블록에서 호출되므로, layerwise든 non-layerwise든 **forward pass가 끝나면 항상 실행**된다. 내부에서 `use_layerwise`를 확인하여 모드에 따라 다른 작업을 수행한다:
+
+```python
+# wait_for_save() 내부 분기
+def wait_for_save(self):
+    if self.use_layerwise:
+        # layerwise: generator의 마지막 iteration 실행 → 비동기 저장 완료 보장
+        for layerwise_storer in self.layerwise_storers:
+            next(layerwise_storer)
+        return
+
+    # non-layerwise: 여기서 전체 레이어의 KV를 한번에 store()
+    for request in connector_metadata.requests:
+        ...
+        self.lmcache_engine.store(token_ids, mask=store_mask, ...)
+```
+
+**Non-layerwise 모드** (기본값): forward pass 중에는 KV save를 하지 않는다. `wait_for_save()` 내부에서 `lmcache_engine.store()`를 호출하여 전체 레이어의 KV를 **한번에** 저장한다. 구현이 단순하지만, store 시간 동안 GPU가 다음 작업을 시작하지 못한다.
+
+**Layerwise 모드**: 각 attention layer에 `@maybe_transfer_kv_layer` decorator ([PR #27816](https://github.com/vllm-project/vllm/pull/27816))가 걸려 있어서, forward pass 도중에 레이어별로 `store_layer()` generator가 비동기로 save를 진행한다. `wait_for_save()`에서는 이 generator의 **마지막 iteration**(`next(storer)`)을 실행하여 아직 완료되지 않은 저장을 마무리한다. GPU compute와 CPU 전송이 overlap되어 latency가 숨겨진다.
+
+아래 코드는 non-layerwise 경로에서 `wait_for_save()`가 실행하는 store 로직이다:
 
 ```python
 def wait_for_save(self):
@@ -752,11 +676,9 @@ def wait_for_save(self):
         )
 ```
 
----
+### 4.5 vLLM Connector → LMCacheEngine: API 경계 정리
 
-## 6. LMCache 내부: store/retrieve는 어떻게 동작하는가
-
-섹션 5에서 vLLM connector가 `start_load_kv()`, `save_kv_layer()`, `wait_for_save()`를 호출하는 것까지 봤다. 이 호출들은 결국 `LMCacheEngine`의 5개 API로 이어진다:
+섹션 3~4를 통해 scheduler와 worker의 실행 흐름을 추적했다. 여기서 한 발 물러서 보면, **KV cache offloading 경로에서** LMCache connector가 `LMCacheEngine`으로 호출하는 API는 5개로 수렴한다 (LMCache connector는 P/D disaggregation에서도 사용될 수 있지만, 그 경우 원격 전송 관련 추가 경로가 활성화된다 — 이 포스트에서는 offloading 경로만 다룬다):
 
 | LMCacheEngine API | vLLM Connector 호출자 | 용도 |
 |---|---|---|
@@ -766,16 +688,32 @@ def wait_for_save(self):
 | `store()` | `wait_for_save()` (non-layerwise) | GPU paged KV buffer → 외부 storage로 KV 저장 |
 | `store_layer()` | `save_kv_layer()` (layerwise) | 위와 동일하나 generator 기반 — 레이어별 파이프라이닝 |
 
-`lookup()`은 Scheduler 프로세스에서 LookupClient → ZMQ → LookupServer → `lmcache_engine.lookup()` 경로로 호출된다. 나머지 4개는 Worker 프로세스에서 직접 호출한다.
+`lookup()`은 scheduler 프로세스에서 LookupClient → ZMQ → LookupServer → `lmcache_engine.lookup()` 경로로 호출된다. 나머지 4개는 worker 프로세스에서 직접 호출한다. 각 API에서 `token_ids`, `slot_mapping`, `kvcaches`(GPU paged buffer 참조), `token_mask`가 공통적으로 전달되며, LMCacheEngine은 이 정보를 바탕으로 GPU paged buffer의 올바른 위치에서 KV를 읽거나 쓴다.
 
-### 6.1 Component 구조
+**P/D disaggregation에서도 같은 5개 API를 사용**하지만, 동작이 달라지는 부분이 있다:
+
+| | Offloading (`kv_both`) | Disagg Producer (`kv_producer`) | Disagg Consumer (`kv_consumer`) |
+|---|---|---|---|
+| `lookup` / `retrieve` | 활성 | 비활성 (KV를 받지 않음) | 활성 |
+| `store` | CPU/disk에 저장 | `transfer_spec=DisaggSpec`으로 **원격 전송** | 비활성 (KV를 보내지 않음) |
+| `save_kv_layer` skip 조건 | chunk 경계 미달 시 skip | **skip 불가** — 원격 전송이므로 반드시 실행 | 항상 skip |
+
+핵심 차이는 `store()`의 `transfer_spec` 파라미터다. Offloading에서는 `None`이라 LocalCPUBackend에 저장하지만, disagg에서는 `DisaggSpec`(receiver host/port 정보)이 전달되어 LMCacheEngine이 원격 노드로 KV를 전송한다.
+
+다음 섹션에서는 이 API 경계를 넘어, LMCacheEngine 내부에서 실제로 무슨 일이 일어나는지를 추적한다.
+
+---
+
+## 5. LMCache 내부: LMCacheEngine은 어떻게 동작하는가
+
+### 5.1 Component 구조
 
 <div class="mermaid-wide">
 flowchart LR
-    subgraph vllm["vLLM (Connector Layer)"]
+    subgraph vllm["vLLM"]
         direction TB
-        SCHED["Scheduler<br/>(LMCacheConnectorV1Impl)"]
-        WORKER["Worker<br/>(LMCacheConnectorV1Impl)"]
+        SCHED["Scheduler"]
+        WORKER["Worker"]
     end
 
     subgraph lmcache["LMCache"]
@@ -784,54 +722,47 @@ flowchart LR
         LC["LookupClient<br/>(scheduler-side)"]
 
         subgraph worker_components["Worker-side"]
+            direction TB
             LS["LookupServer"]
             ZMQ_OFF["ZMQOffloadServer"]
             ENGINE["LMCacheEngine"]
-            TDB["TokenDatabase<br/>(prefix-hash → chunk key)"]
-            GPU_CONN["GPUConnector<br/>(CUDA kernel)"]
+            TDB["TokenDatabase"]
+            GPU_CONN["GPUConnector"]
         end
 
         subgraph storage["StorageManager"]
             direction TB
-            subgraph cpu_path[" CPU 경유 (기본) "]
-                direction LR
-                CPU_BE["LocalCPUBackend<br/>(pinned memory pool)"]
-                REMOTE["RemoteBackend<br/>(Redis/Valkey)"]
-                DISK["LocalDiskBackend"]
-            end
-            subgraph direct_path[" CPU bypass (GPU Direct) "]
-                direction LR
-                GDS["GdsBackend<br/>(GPU ↔ NVMe)"]
-                NIXL["NixlStorageBackend<br/>(GPU ↔ GPU, RDMA)"]
-            end
+            CPU_BE["LocalCPUBackend"]
+            REMOTE["RemoteBackend"]
+            DISK["LocalDiskBackend"]
+            GDS["GdsBackend"]
+            NIXL["NixlBackend"]
         end
 
-        BMS["BatchedMessageSender<br/>(admit/evict 통지)"]
+        BMS["BatchedMessageSender"]
     end
 
     subgraph external["External"]
-        CC["Cache Controller<br/>(cross-node 관리)"]
+        CC["Cache Controller"]
     end
 
-    SCHED -->|"lookup()"| LC
+    SCHED -->|"lookup"| LC
     LC -.->|ZMQ| LS
     LS --> ENGINE
-    CC -.->|"P2P lookup 응답"| LS
+    CC -.->|"P2P lookup"| LS
 
     WORKER -.->|"ZMQ IPC"| ZMQ_OFF
-    ZMQ_OFF -->|"store()"| ENGINE
+    ZMQ_OFF -->|"store"| ENGINE
     ENGINE --> TDB
     ENGINE --> GPU_CONN
     ENGINE --> storage
 
-    CPU_BE -->|"evict/admit"| BMS
+    storage -->|"evict/admit"| BMS
     BMS -->|ZMQ| CC
 
     style ENGINE fill:#4a90d9,stroke:#333,color:#fff
     style CPU_BE fill:#e67e22,stroke:#333,color:#fff
     style GPU_CONN fill:#27ae60,stroke:#333,color:#fff
-    style cpu_path fill:#fff8e1,stroke:#e67e22,stroke-dasharray:5 5
-    style direct_path fill:#e8f5e9,stroke:#27ae60,stroke-dasharray:5 5
     style GDS fill:#27ae60,stroke:#333,color:#fff
     style NIXL fill:#27ae60,stroke:#333,color:#fff
     style CC fill:#9b59b6,stroke:#333,color:#fff
@@ -839,24 +770,43 @@ flowchart LR
 
 핵심 구성 요소:
 
+**Lookup (Scheduler ↔ Worker RPC)**
+
+| Component | Side | 역할 |
+|-----------|------|------|
+| **`LookupClient`** | Scheduler | `get_num_new_matched_tokens()` 호출 시 ZMQ로 cache hit 수 조회 |
+| **`LookupServer`** | Worker | LookupClient 요청을 받아 `LMCacheEngine.lookup()` 실행 후 결과 반환 |
+
+**Core Engine (Worker)**
+
 | Component | 역할 |
 |-----------|------|
-| **`LookupClient`** | Scheduler-side. `get_num_new_matched_tokens()` 호출 시 ZMQ로 LookupServer에 cache hit 조회 |
-| **`LookupServer`** | Worker-side. LookupClient의 요청을 받아 `LMCacheEngine.lookup()` 실행 후 결과 반환 |
-| **`ZMQOffloadServer`** | Worker-side. vLLM의 multi-process worker 아키텍처에서 LMCacheEngine이 있는 프로세스와 다른 프로세스의 offload 요청을 ZMQ IPC로 수신하여 `store()` 실행. LMCacheEngine에 직접 접근할 수 없는 프로세스가 KV 저장을 위임할 때 사용 |
 | **`LMCacheEngine`** | 중앙 허브. store/retrieve/lookup의 진입점 |
 | **`TokenDatabase`** | token ID 시퀀스 → 256-token chunk 단위의 `CacheEngineKey`(prefix hash chain) 변환 |
 | **`GPUConnector`** | GPU paged KV buffer ↔ CPU/Storage 간 데이터 이동. CUDA kernel(`lmc_ops`) 사용 |
-| **`StorageManager`** | 여러 storage backend를 관리. put/get을 모든 backend에 분배 |
-| **`LocalCPUBackend`** | 항상 생성되는 primary store + allocator. pinned CPU memory pool에서 `MemoryObj` 할당 |
-| **`GdsBackend`** | GPU Direct Storage — GPU ↔ NVMe SSD를 CPU bypass로 직접 DMA |
-| **`NixlStorageBackend`** | RDMA 기반 — GPU ↔ 원격 GPU/Storage를 CPU bypass로 직접 전송 |
-| **`BatchedMessageSender`** | CPU backend의 admit/evict 이벤트를 batching하여 Cache Controller에 전달 |
-| **`Cache Controller`** | 별도 프로세스. 어떤 worker가 어떤 chunk를 갖고 있는지 전역 인덱스를 관리. P2P lookup 시 "이 chunk는 worker #3에 있다"는 정보를 제공하고, worker 등록/해제와 cross-node 데이터 이동을 조율 |
+| **`ZMQOffloadServer`** | LMCacheEngine에 직접 접근할 수 없는 프로세스의 store 요청을 ZMQ IPC로 수신하여 중계 |
 
-### 6.2 Store 흐름
+**Storage Backends (Worker)**
 
-`save_kv_layer()` → `LMCacheEngine.store()`가 호출되면, 설정된 backend에 따라 데이터 경로가 달라진다:
+| Component | CPU 경유 | 역할 |
+|-----------|---------|------|
+| **`StorageManager`** | — | 여러 backend를 관리. put/get을 모든 backend에 분배 |
+| **`LocalCPUBackend`** | Yes | 항상 생성되는 primary store + allocator. pinned CPU memory pool에서 `MemoryObj` 할당 |
+| **`LocalDiskBackend`** | Yes | CPU DRAM → NVMe SSD. 설정 시 활성화 |
+| **`RemoteBackend`** | Yes | CPU DRAM → Redis/Valkey 등 네트워크 전송 |
+| **`GdsBackend`** | **No** | GPU Direct Storage — GPU ↔ NVMe SSD를 CPU bypass로 직접 DMA |
+| **`NixlStorageBackend`** | **No** | RDMA 기반 — GPU ↔ 원격 GPU/Storage를 CPU bypass로 직접 전송 |
+
+**Cross-node 관리 (별도 프로세스)**
+
+| Component | 역할 |
+|-----------|------|
+| **`BatchedMessageSender`** | LocalCPUBackend의 admit/evict 이벤트를 batching하여 Cache Controller에 전달 |
+| **`Cache Controller`** | 어떤 worker가 어떤 chunk를 보유하는지 전역 인덱스 관리. P2P lookup 응답, worker 등록/해제, cross-node 데이터 이동 조율 |
+
+### 5.2 Store 흐름: GPU → CPU
+
+아래는 가장 기본적인 `LocalCPUBackend` 경로를 기준으로 한 store 흐름이다. GDS/NIXL 등 다른 backend가 설정되어 있으면 `batched_put()`에서 병렬로 추가 경로가 실행된다.
 
 <div class="mermaid-wide">
 sequenceDiagram
@@ -866,61 +816,34 @@ sequenceDiagram
     participant G as GPUConnector
     participant SM as StorageManager
     participant CPU as LocalCPUBackend
-    participant DRAM as CPU DRAM<br/>(pinned memory)
-    participant SSD as NVMe SSD
-    participant GDS as GdsBackend
-    participant BMS as BatchedMsg<br/>Sender
 
     V->>E: store(token_ids, slot_mapping, kvcaches)
 
     E->>T: process_tokens(token_ids)
-    Note over T: 256-token chunk로 분할<br/>각 chunk에 prefix hash 계산<br/>→ CacheEngineKey 목록
+    Note over T: 256-token chunk로 분할<br/>prefix hash chain → CacheEngineKey[]
     T-->>E: keys[]
 
     E->>SM: allocate(keys)
-    SM->>CPU: allocate from pool
+    SM->>CPU: allocate from pinned memory pool
     alt pool 가득 참
-        CPU->>DRAM: LRU evict → 메모리 반환
-        CPU->>BMS: add_kv_op(EVICT, old_key)
+        CPU->>CPU: LRU evict → 메모리 반환
     end
-    CPU-->>SM: MemoryObj[] (빈 텐서)
+    CPU-->>SM: MemoryObj[] — 빈 CPU 텐서
 
     E->>G: batched_from_gpu(slot_mapping, MemoryObj[])
-    Note over G: CUDA kernel (D2H):<br/>GPU paged KV → CPU pinned memory
-    G->>DRAM: KV 데이터 복사
-    G-->>E: MemoryObj[] (채워짐)
+    Note over G: CUDA kernel D2H:<br/>GPU paged KV → CPU pinned memory
+    G-->>E: MemoryObj[] — KV 데이터 채워짐
 
     E->>SM: batched_put(keys, MemoryObj[])
-
-    rect rgba(255, 200, 100, 0.15)
-    Note over CPU,DRAM: 🟠 LocalCPUBackend (기본)
     SM->>CPU: submit_put(key, MemoryObj)
-    Note over DRAM: CPU DRAM에 보존
-    CPU->>BMS: add_kv_op(ADMIT, key)
-    end
-
-    rect rgba(100, 150, 255, 0.15)
-    Note over CPU,SSD: 🔵 LocalDiskBackend (활성 시)
-    SM->>SSD: async write(key, data)
-    Note over SSD: CPU DRAM → NVMe SSD (비동기)
-    end
-
-    rect rgba(100, 200, 100, 0.15)
-    Note over GDS,SSD: 🟢 GdsBackend (활성 시, CPU bypass)
-    SM->>GDS: submit_put(key, data)
-    GDS->>SSD: GPU → NVMe 직접 DMA<br/>(cuFile, CPU 미경유)
-    end
+    Note over CPU: CPU DRAM에 보존 완료
 </div>
 
-주목할 점:
-- 🟠 **LocalCPUBackend** (기본, 항상 활성) — GPU → CPU DRAM. `LocalCPUBackend`가 allocator 역할을 겸하므로 항상 CPU를 거침
-- 🔵 **LocalDiskBackend** (선택) — CPU DRAM → NVMe SSD. CPU를 거쳐서 SSD에 저장
-- 🟢 **GdsBackend** (선택, CPU bypass) — GPU → NVMe SSD 직접 DMA. `cuFile` API로 CPU bounce buffer 없이 전송
-- **CPU 할당과 eviction이 store 시점에 발생**한다 — 섹션 1.6에서 설명한 CPU eviction이 바로 여기서 일어남
+> CPU 할당과 LRU eviction이 store 시점에 발생한다 — 섹션 1.6에서 설명한 CPU eviction이 바로 이 `allocate()` 호출에서 일어난다.
 
-### 6.3 Retrieve 흐름
+### 5.3 Retrieve 흐름: CPU → GPU
 
-`start_load_kv()` → `LMCacheEngine.retrieve()`가 호출되면, 데이터가 어느 backend에 있느냐에 따라 CPU를 거칠 수도, 건너뛸 수도 있다:
+아래는 `LocalCPUBackend`에서 hit된 경우의 retrieve 흐름이다. 다른 backend(Disk, GDS, NIXL)에서 hit되면 `batched_get()`에서 해당 backend의 get을 호출하고, 결과를 LocalCPU에 write-back한다.
 
 <div class="mermaid-wide">
 sequenceDiagram
@@ -928,11 +851,7 @@ sequenceDiagram
     participant E as LMCacheEngine
     participant T as TokenDatabase
     participant SM as StorageManager
-    participant DRAM as CPU DRAM<br/>(pinned memory)
     participant CPU as LocalCPUBackend
-    participant SSD as NVMe SSD
-    participant GDS as GdsBackend
-    participant NIXL as NixlBackend
     participant G as GPUConnector
 
     V->>E: retrieve(token_ids, token_mask, slot_mapping, kvcaches)
@@ -941,56 +860,20 @@ sequenceDiagram
     T-->>E: keys[]
 
     E->>SM: batched_contains(keys)
-    Note over SM: 각 backend에 순서대로 확인:<br/>LocalCPU → Disk → GDS → NIXL
-    SM-->>E: block_mapping (key → backend)
+    Note over SM: backend 순서대로 확인
+    SM-->>E: block_mapping — key별 hit backend
 
     E->>SM: batched_get(keys, block_mapping)
-
-    rect rgba(255, 200, 100, 0.15)
-    Note over CPU,DRAM: 🟠 LocalCPU hit
     SM->>CPU: get_blocking(key)
-    CPU->>DRAM: read
-    DRAM-->>SM: MemoryObj
+    CPU-->>SM: MemoryObj
     SM-->>E: MemoryObj[]
+
     E->>G: batched_to_gpu(MemoryObj[], slot_mapping)
-    Note over G: CUDA kernel (H2D):<br/>CPU DRAM → GPU paged KV
-    end
-
-    rect rgba(100, 150, 255, 0.15)
-    Note over SSD: 🔵 LocalDisk hit (CPU 경유)
-    SM->>SSD: read(key)
-    SSD->>DRAM: NVMe → CPU DRAM
-    DRAM-->>SM: MemoryObj
-    SM->>CPU: write-back (다음 접근 시 local hit)
-    SM-->>E: MemoryObj[]
-    E->>G: batched_to_gpu → GPU
-    end
-
-    rect rgba(100, 200, 100, 0.15)
-    Note over GDS,SSD: 🟢 GDS hit (CPU bypass)
-    SM->>GDS: get(key)
-    GDS->>SSD: NVMe → GPU 직접 DMA<br/>(cuFile, CPU 미경유)
-    GDS-->>SM: GPU에 직접 로드 완료
-    end
-
-    rect rgba(200, 150, 255, 0.15)
-    Note over NIXL: 🟣 NIXL hit (CPU bypass)
-    SM->>NIXL: get(key)
-    Note over NIXL: RDMA: 원격 GPU → local GPU<br/>(CPU 미경유)
-    NIXL-->>SM: GPU에 직접 로드 완료
-    end
-
+    Note over G: CUDA kernel H2D:<br/>CPU pinned memory → GPU paged KV
     G-->>V: GPU KV buffer에 KV 복원 완료
 </div>
 
-주목할 점:
-- 🟠 **LocalCPU hit** — CPU DRAM → CUDA kernel(H2D) → GPU. 가장 빠른 경로 (PCIe bandwidth)
-- 🔵 **LocalDisk hit** — NVMe SSD → CPU DRAM → GPU. CPU를 거침. write-back으로 다음 접근 시 🟠 경로로 승격
-- 🟢 **GDS hit** — NVMe SSD → GPU 직접 DMA. `cuFile` API로 CPU bypass
-- 🟣 **NIXL hit** — 원격 GPU → local GPU RDMA. 네트워크를 타지만 CPU bypass
-- **계층적 lookup 우선순위**: LocalCPU → Disk → GDS → NIXL. 가까운 tier에서 hit되면 느린 tier는 skip
-
-### 6.4 GPU-Native Primitives
+### 5.4 GPU-Native Primitives
 
 위의 store/retrieve 흐름에서 `GPUConnector`가 "CUDA kernel로 복사"한다고만 설명했는데, 실제 구현은 상당히 정교하다. vLLM의 paged KV buffer와 LMCache의 contiguous chunk 사이의 **format 변환**, **async stream 관리**, **pinned memory 할당**, **layerwise double-buffering**이 모두 GPU-native primitive 위에 구축되어 있다.
 
@@ -1044,9 +927,14 @@ flowchart LR
 </div>
 
 > 왼쪽: block이 물리적으로 흩어져 있음 (block #1, #3, #6...). 오른쪽: 256 토큰이 연속 배치.
-> `slot_mapping`이 "token N → physical slot M" 매핑을 제공하여, kernel이 흩어진 block에서 올바른 위치를 scatter/gather한다.
 
-이 format 변환은 별도 단계가 아니라, **GPU ↔ CPU 데이터 이동과 동시에** 한번의 kernel launch로 수행된다. 호출 경로:
+**왜 scatter/gather가 필요한가?** vLLM은 KV를 paged block 단위로 GPU 메모리 여기저기에 흩어서 저장한다 — token 0-15는 physical block #1에, token 16-31은 block #3에, token 32-47은 block #6에 있을 수 있다. 반면 LMCache는 256개 토큰의 KV를 **하나의 연속된 메모리**에 담아야 한다 (chunk 단위로 해싱하고 저장하기 때문이다).
+
+이 두 layout 사이를 변환하는 것이 scatter/gather다:
+- **Gather** (store, D2H): GPU의 흩어진 block들에서 토큰별 KV를 **모아서** CPU의 연속 버퍼에 쓴다
+- **Scatter** (retrieve, H2D): CPU의 연속 버퍼에서 토큰별 KV를 읽어 GPU의 **흩어진 block 위치에 뿌린다**
+
+`slot_mapping`이 이 변환의 핵심이다 — "token N의 KV는 physical slot M에 있다"는 매핑을 제공하여, kernel이 각 토큰의 올바른 위치를 계산할 수 있게 한다. 이 변환은 별도 단계가 아니라, **GPU ↔ CPU 데이터 이동과 동시에** 한번의 kernel launch로 수행된다. 호출 경로:
 
 ```
 Store (D2H):
@@ -1275,23 +1163,7 @@ class VLLMPagedMemLayerwiseGPUConnector:
             yield  # caller가 attention 수행
 ```
 
-**4. GPU Memory** — intermediate buffer, raw pointer 추출.
-
-```python
-# GPU intermediate buffer (double-buffering용)
-gpu_buffer = torch.empty(
-    [2, num_tokens, hidden_dim],
-    dtype=kv_dtype, device="cuda"
-)
-
-# CUDA kernel에 raw pointer 전달
-key_value_ptrs = torch.tensor(
-    [kv_cache[layer].data_ptr() for layer in range(num_layers)],
-    dtype=torch.uint64, device="cuda"
-)
-```
-
-**5. cuFile (GDS)** — GPU ↔ NVMe 직접 DMA.
+**4. cuFile (GDS)** — GPU ↔ NVMe 직접 DMA.
 
 ```python
 # lmcache/v1/storage_backend/gds_backend.py
@@ -1310,7 +1182,7 @@ class GdsBackend:
         f.read(gpu_addr, nbytes, file_offset=offset)   # NVMe → GPU 직접 DMA
 ```
 
-**6. NIXL (RDMA)** — GPU VRAM 직접 등록 후 원격 전송.
+**5. NIXL (RDMA)** — GPU VRAM 직접 등록 후 원격 전송.
 
 ```python
 # lmcache/v1/storage_backend/nixl_storage_backend.py
@@ -1334,55 +1206,7 @@ class NixlStorageAgent:
 
 ---
 
-## 7. 전체 실행 흐름
-
-<div class="mermaid-wide">
-sequenceDiagram
-    participant S as Scheduler
-    participant W as Worker
-    participant LMC as LMCacheEngine
-    participant KV as GPU KV Buffer
-    participant EXT as CPU/Disk/Remote
-
-    rect rgba(200, 220, 255, 0.15)
-    Note over S: Scheduler Process
-
-    S->>S: ① get_computed_blocks(request)<br/>→ num_local_computed_tokens
-    S->>S: ② get_num_new_matched_tokens()<br/>→ lookup_client.lookup(token_ids)<br/>→ LoadSpec(vllm_cached, lmcache_cached)
-    S->>S: ③ allocate_slots(total_computed)
-    S->>S: ④ update_state_after_alloc()<br/>→ LoadSpec.can_load = True
-    S->>S: ⑤ build_connector_meta()<br/>→ LMCacheConnectorMetadata
-    S->>W: scheduler_output (KVConnectorMetadata 포함)
-    end
-
-    rect rgba(255, 220, 200, 0.15)
-    Note over W,EXT: Worker Process
-
-    W->>W: ⑥ bind_connector_metadata(meta)
-    W->>LMC: ⑦ start_load_kv()
-    LMC->>EXT: retrieve()
-    EXT-->>KV: CPU/Disk/Remote → GPU paged KV buffer
-
-    rect rgba(255, 255, 200, 0.15)
-    Note over W,KV: ⑧ Model Forward (per layer)
-    loop @maybe_transfer_kv_layer
-        W->>LMC: wait_for_layer_load(layer_name)
-        Note over W: attention_forward(Q, K, V)
-        W->>LMC: save_kv_layer(layer_name)
-    end
-    end
-
-    W->>LMC: ⑨ wait_for_save()
-    LMC->>KV: store()
-    KV-->>EXT: GPU → CPU/Disk/Remote
-    W->>W: ⑩ get_finished(finished_req_ids)
-    W->>W: ⑪ clear_connector_metadata()
-    end
-</div>
-
----
-
-## 8. LMCache vs OffloadingConnector 비교
+## 6. LMCache vs OffloadingConnector 비교
 
 [`OffloadingConnector`](https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py)는 vLLM에 내장된 CPU offloading 구현이다 ([PR #22595](https://github.com/vllm-project/vllm/pull/22595)). LMCache와의 주요 차이:
 
