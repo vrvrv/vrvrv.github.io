@@ -1042,13 +1042,24 @@ KVRole = Literal[KVProducer, KVConsumer]
 **LMCache 측**: `enable_pd=True` + `local_cpu=True` + `max_local_cpu_size > 0` + `save_decode_cache=True`를 설정한다.
 
 ```yaml
-# lmcache config 예시
+# lmcache-config.yaml 예시
 chunk_size: 256
 max_local_cpu_size: 40g
 local_cpu: true
 enable_pd: true
-save_decode_cache: true   # decode phase KV도 저장
-# NIXL 관련 설정
+transfer_channel: "nixl"
+save_decode_cache: true          # decode phase KV도 저장
+save_unfull_chunk: false
+
+# NIXL buffer 설정
+# buffer size는 chunk size로 나누어떨어져야 함
+nixl_buffer_size: 3019898880     # ~2880MiB (Qwen3-4B/8B/32B 기준)
+nixl_buffer_device: cpu
+
+# NIXL storage backend는 이 시나리오에서 사용하지 않음
+# (SSD offloading은 후속 포스트에서 다룸)
+extra_config:
+  enable_nixl_storage: false
 ```
 
 ### 왜 동시에 동작하는가: StorageManager의 multi-backend 구조
