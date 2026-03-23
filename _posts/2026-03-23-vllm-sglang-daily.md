@@ -165,6 +165,18 @@ Hybrid 모델에서 preemption 시 mamba state가 소실되어 `num_computed_tok
 향후 V1 엔진의 상태 전이 모델 자체를 재검토할 필요성을 시사한다.
 결국 이 기간의 이슈들은 앞선 섹션에서 다룬 KV Cache 추상화 재설계, MoE 메모리 효율화, P/D 운영 안정성 작업이 **왜 지금 이 속도로 진행되는지**를 설명하는 counterpart다. 개별 기능이 아닌 기능 조합의 안정성이 vLLM의 현재 최대 과제다.
 
+## Blog & Article Highlights
+
+| 날짜 | 출처 | 제목 |
+|------|------|------|
+| 3/13 | vLLM Blog | [P-EAGLE: Faster LLM inference with Parallel Speculative Decoding in vLLM](https://vllm.ai/blog/p-eagle) |
+| 3/19 | PyTorch Blog | [TorchSpec: Speculative Decoding Training at Scale](https://pytorch.org/blog/torchspec-speculative-decoding-training-at-scale/) |
+| 3/12 | PyTorch Blog | [MXFP8 Training for MoEs: 1.3x training speedup vs BF16 for Llama4 Scout on GB200](https://pytorch.org/blog/mxfp8-training-for-moes-1-3x-training-speedup-vs-bf16-for-llama4-scout-on-gb200-cluster-using-torchao-and-torchtitan/) |
+| 3/18 | PyTorch Blog | [Generalized Dot-Product Attention: Tackling Real-World Challenges in GPU Training Kernels](https://pytorch.org/blog/generalized-dot-product-attention-tackling-real-world-challenges-in-gpu-training-kernels/) |
+| 3/16 | NVIDIA Blog | [How NVIDIA Dynamo 1.0 Powers Multi-Node Inference at Production Scale](https://developer.nvidia.com/blog/nvidia-dynamo-1-production-ready/) |
+
+vLLM의 P-EAGLE 포스트는 이번 포스트의 Speculative Decoding 섹션과 직접 연결된다. TorchSpec은 spec decode를 training 관점에서 다루며, MXFP8 Training for MoEs는 SGLang #18858의 MXFP4 weight loading 최적화와 같은 맥락의 MoE 양자화 효율 주제다.
+
 ---
 
 *Sources: [vLLM GitHub](https://github.com/vllm-project/vllm), [SGLang GitHub](https://github.com/sgl-project/sglang)*
