@@ -50,9 +50,14 @@ li { margin: 0.4rem 0; }
 *:target { background: yellow; }
 
 .w {
-  max-width: 800px;
+  max-width: 900px;
   margin: 0 auto;
-  padding: 4rem 2rem;
+  padding: 4rem 1rem;
+  box-sizing: border-box;
+}
+
+@media (max-width: 600px) {
+  .w { padding: 2rem 1rem; }
 }
 
 hr {
@@ -64,6 +69,11 @@ hr {
 }
 
 table { width: 100%; }
+
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
 
 table, th, td {
   border: thin solid black;

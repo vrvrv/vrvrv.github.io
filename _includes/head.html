@@ -35,6 +35,7 @@
     });
   </script>
   <style>
+    html { overflow-x: hidden; }
     .mermaid { font-size: 11px; overflow-x: auto; }
     .mermaid svg { max-height: 600px; }
     .mermaid-wide { font-size: 11px; overflow-x: auto; }
@@ -43,6 +44,10 @@
     table { font-size: 0.85em; }
     table th, table td { padding: 0.3em 0.6em; }
     #markdown-toc ul ul { display: none; }
+    @media (max-width: 600px) {
+      table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      pre, code { word-break: break-all; }
+    }
 
     /* Floating TOC */
     .floating-toc {
@@ -61,15 +66,17 @@
     .floating-toc ul { list-style: none; padding: 0; margin: 0; }
     .floating-toc li { margin: 0.2rem 0; }
     .floating-toc li.toc-h3 { padding-left: 0.8rem; }
-    .floating-toc li.toc-h4 { padding-left: 1.6rem; }
     .floating-toc a { color: #888; text-decoration: none; }
     .floating-toc a:hover { color: #333; }
     .floating-toc a.active { color: #000; font-weight: bold; }
+    @media (min-width: 1201px) {
+      .page-content { padding-right: 280px; }
+    }
     @media (max-width: 1200px) { .floating-toc { display: none; } }
   </style>
   <script>
     document.addEventListener('DOMContentLoaded', function() {
-      const headings = document.querySelectorAll('h2[id], h3[id], h4[id]');
+      const headings = document.querySelectorAll('h2[id], h3[id]');
       if (headings.length === 0) return;
       const toc = document.createElement('nav');
       toc.className = 'floating-toc';
