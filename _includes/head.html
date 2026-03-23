@@ -27,7 +27,7 @@
       mermaid.initialize({
         startOnLoad: false,
         theme: isDark ? 'dark' : 'neutral',
-        fontSize: 12,
+        fontSize: 11,
         flowchart: { useMaxWidth: true, nodeSpacing: 20, rankSpacing: 30 },
         sequence: { useMaxWidth: true, noteMargin: 8, messageMargin: 30 }
       });
@@ -35,10 +35,14 @@
     });
   </script>
   <style>
-    .mermaid { font-size: 12px; overflow-x: auto; }
+    .mermaid { font-size: 11px; overflow-x: auto; }
     .mermaid svg { max-height: 600px; }
-    .mermaid-wide { font-size: 13px; overflow-x: auto; }
+    .mermaid-wide { font-size: 11px; overflow-x: auto; }
     .mermaid-wide svg { max-height: none; width: 100%; }
+    blockquote { font-size: 0.8em; color: #666; }
+    table { font-size: 0.85em; }
+    table th, table td { padding: 0.3em 0.6em; }
+    #markdown-toc ul ul { display: none; }
 
     /* Floating TOC */
     .floating-toc {
