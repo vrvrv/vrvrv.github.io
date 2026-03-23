@@ -6,10 +6,11 @@ title: "vLLM/SGLang Daily - 2026-03-23"
 
 ## Highlights
 
-3/12~3/23 기간 동안 vLLM은 세 가지 방향에서 대규모 구조적 변화를 보였다:
-**(1) KV Cache 추상화 계층 재설계** — HMA 모델 contiguous allocation, pluggable eviction policy(T-LRU), kv_offload+HMA 시리즈로 connector→eviction→allocation을 일관된 아키텍처로 통합 중이다.
-**(2) P/D Disaggregation 운영 안정성** — MooncakeConnector health check, stale callback 처리, Mamba heterogeneous TP 실험 등 장애 복구와 이종 모델 P/D를 정면으로 다루고 있다.
-**(3) MoE 메모리 효율** — MLA decode buffer 공유(15 GiB→256 MiB), 런타임 expert pruning(RIY), MoE oracle 통합 등 대규모 MoE 서빙의 VRAM 병목을 운영 레벨에서 해결하고 있다.
+3/12~3/23 기간 동안 vLLM은 세 가지 축에서 대규모 구조적 변화를 보이며, 이들이 하나의 큰 흐름으로 수렴하고 있다:
+**(1) KV Cache 추상화 재설계** — HMA contiguous allocation, pluggable eviction(T-LRU), kv_offload+HMA 시리즈로 allocation→eviction→connector를 통합 아키텍처로 정리 중이다.
+**(2) P/D Disaggregation 운영 안정성** — MooncakeConnector health check, stale callback 처리, Mamba heterogeneous TP 실험 등 장애 복구와 이종 모델 P/D를 다루고 있다.
+**(3) MoE 메모리 효율** — MLA decode buffer 공유(15 GiB→256 MiB), 런타임 expert pruning(RIY), MoE oracle 통합으로 대규모 서빙의 VRAM 병목을 해결하고 있다.
+이 세 축의 교차점은 "Hybrid Model(GDN/Mamba+Attention) + MoE + P/D"가 동시에 활성화되는 배포 시나리오이며, 3/11 이후 이 조합이 만드는 경계조건(deadlock, livelock, OOM)이 연이어 보고되면서 각 축의 변경이 더 빠르게 진행되고 있다.
 
 ## Speculative Decoding
 
@@ -63,6 +64,7 @@ P/D disaggregation 운영 측면에서 #37859와 #37894는 3/11 포스트에서 
 #37859는 request가 이미 abort된 후 비동기로 도착하는 KV transfer 완료 콜백이 `self.requests`에서 request를 찾지 못해 assert로 죽던 문제를 "stale callback으로 간주하고 skip"하는 방식으로 수정한다.
 #37894는 더 근본적으로, proxy 레벨에서 prefill 노드의 health를 주기적으로 체크하고 장애 시 round-robin에서 자동 제외, 복구 시 재포함하는 메커니즘이다.
 두 PR 모두 "P/D 분리 아키텍처에서 노드 간 상태 불일치가 전체 파이프라인을 멈추는 문제"를 서로 다른 레이어에서 방어한다.
+KV allocation의 contiguous 보장(#37885)이 connector의 RDMA 효율을 높이고, connector의 운영 안정성(#37859, #37894)이 그 위에서 P/D를 안정적으로 유지하는 구조다.
 
 ## MoE / Large Scale Serving
 
@@ -98,6 +100,7 @@ MK 경로에서는 `select_experts()`가 local 토큰만 보므로 `cumsum[-1] =
 
 MRV2의 PP 지원도 꾸준히 진행 중이다. #37830이 PP + CUDA graph 테스트를 활성화하고, #37818이 piecewise CUDA graph에서 불필요한 hidden states allocation을 제거한다.
 vLLM의 PP 지원이 "실험적 기능"에서 "CI 테스트가 붙은 검증 완료 기능"으로 넘어가는 과정이다.
+MoE 트랙의 변경들은 KV Cache 섹션의 P/D 안정성 작업과 맞물린다: #37799의 MLA 메모리 절감은 DP4 같은 대규모 배포에서 KV cache에 할당 가능한 여유를 직접 늘리며, #37824의 expert pruning은 VRAM 절감분을 더 큰 KV cache pool이나 더 높은 batch size로 전환할 수 있게 한다.
 
 ## Kernel & Performance
 
@@ -160,6 +163,7 @@ Hybrid 모델에서 preemption 시 mamba state가 소실되어 `num_computed_tok
 이전 실행의 `in_progress_prompt_logprobs_cpu`가 잔류하면 새 계산과 충돌해 livelock이 발생한다.
 이 문제들은 async scheduling + hybrid model + preemption + prefix caching이 동시에 활성화될 때 증폭되므로,
 향후 V1 엔진의 상태 전이 모델 자체를 재검토할 필요성을 시사한다.
+결국 이 기간의 이슈들은 앞선 섹션에서 다룬 KV Cache 추상화 재설계, MoE 메모리 효율화, P/D 운영 안정성 작업이 **왜 지금 이 속도로 진행되는지**를 설명하는 counterpart다. 개별 기능이 아닌 기능 조합의 안정성이 vLLM의 현재 최대 과제다.
 
 ---
 
