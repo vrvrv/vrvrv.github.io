@@ -169,21 +169,36 @@ Layer 32: K_cache[slot 90] = Layer 32(draft)가 계산한 position 10의 key
 
 ### 3.3 코드에서 이것이 어떻게 구현되는가
 
-**Layer Naming**: EAGLE draft model의 layer는 `model.layers.32.self_attn`이라는 이름을 가진다 (`start_layer_id=target_layer_num`):
+3단계로 나뉜다: **(1) KV 텐서 할당** → **(2) 같은 group에 등록** → **(3) slot mapping 전달**.
+
+**Step 1: KV 텐서 할당 — "옥탑방 만들기"**
+
+vLLM은 초기화 시 `initialize_kv_cache_tensors()`에서 모든 attention layer에 대해 KV 텐서를 할당한다. 결과는 `kv_caches: dict[str, torch.Tensor]` — **layer_name을 key로 하는 dict**다:
 
 ```python
-# llama_eagle.py
-self.layers = nn.ModuleList([
-    LlamaDecoderLayer(
-        prefix=f"model.layers.{i + start_layer_id}",  # "model.layers.32"
-    )
-    for i in range(self.config.num_hidden_layers)  # 보통 1
-])
+# gpu_model_runner.py — initialize_kv_cache_tensors()
+# 결과:
+kv_caches = {
+    "model.layers.0.self_attn":  tensor([2, num_blocks, block_size, ...]),  # Layer 0
+    "model.layers.1.self_attn":  tensor([2, num_blocks, block_size, ...]),  # Layer 1
+    ...
+    "model.layers.31.self_attn": tensor([2, num_blocks, block_size, ...]),  # Layer 31
+    "model.layers.32.self_attn": tensor([2, num_blocks, block_size, ...]),  # ← EAGLE!
+}
 ```
 
-이름만 32번이지 draft model의 첫 번째(유일한) layer다. 이 이름 덕분에 vLLM의 KV cache 시스템이 Layer 32 전용 K/V 텐서를 할당한다.
+Target model만 있으면 Layer 0~31까지 32개의 KV 텐서가 할당된다. EAGLE이 추가되면 `model.layers.32.self_attn`이라는 이름의 **33번째 KV 텐서가 할당**된다. 이 이름은 `start_layer_id=target_layer_num`에서 온다:
 
-**같은 KV Cache Group**: Draft layer는 target layer와 같은 group에 배치된다:
+```python
+# llama_eagle.py — EAGLE draft model의 layer 이름
+prefix = f"model.layers.{i + start_layer_id}"  # "model.layers.32"
+```
+
+이름만 32번이지 draft model의 첫 번째(유일한) layer다. 이 이름 덕분에 vLLM의 KV cache 시스템이 Layer 32 전용 텐서를 할당하는 것이다. 비유하면 32층 아파트에 옥탑방 1개를 추가한 것과 같다.
+
+**Step 2: 같은 KV Cache Group — "같은 동, 같은 주소 체계"**
+
+Draft layer는 target layer와 **같은 KV cache group**에 배치된다:
 
 ```python
 # eagle.py — initialize_attn_backend()
@@ -192,51 +207,37 @@ for gid, group in enumerate(kv_cache_config.kv_cache_groups):
         self.kv_cache_gid = gid    # target과 같은 group
 ```
 
-같은 group = 같은 block pool = **같은 block_table로 주소 변환**. 각 layer는 자기 K/V 텐서를 갖지만, "position X는 slot Y에 있다"는 규칙은 group 내 모든 layer가 동일하다. (Hybrid attention 모델에서는 drafter layer가 여러 group에 분산될 수 있어 [PR #35062](https://github.com/vllm-project/vllm/pull/35062)에서 drafter layer를 전용 group으로 분리하는 수정이 이루어졌다.)
+같은 group = 같은 block pool = 같은 block_table. 따라서 모든 33개 layer가 "position X → slot Y"라는 **동일한 주소 변환 규칙**을 따른다. (Hybrid attention 모델에서는 drafter layer가 여러 group에 분산될 수 있어 [PR #35062](https://github.com/vllm-project/vllm/pull/35062)에서 drafter layer를 전용 group으로 분리하는 수정이 이루어졌다.)
 
-**Slot Mapping 전달**: `_get_slot_mapping()`은 target model이 계산한 slot_mapping을 draft layer 이름으로 래핑하여 전달한다:
+**Step 3: Slot Mapping 전달 — "옥탑방에 주소 알려주기"**
+
+Target model forward 시, `slot_mappings_by_layer`가 생성된다. 이것은 같은 group의 모든 layer에 **동일한 slot_mapping**을 매핑하는 dict다:
+
+```python
+# gpu_model_runner.py — target forward 시
+slot_mappings_by_layer = {}
+for gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+    slot_mapping = slot_mappings_by_gid[gid]           # position → slot 주소 배열
+    for layer_name in kv_cache_group.layer_names:      # Layer 0~31
+        slot_mappings_by_layer[layer_name] = slot_mapping
+# → {"model.layers.0.self_attn": [90,91,92,...], ..., "model.layers.31.self_attn": [90,91,92,...]}
+```
+
+여기서 **Layer 32는 빠져있다** — target forward에서는 draft layer가 실행되지 않으므로. Draft model이 실행될 때 `_get_slot_mapping()`이 이 빈자리를 채운다:
 
 ```python
 # eagle.py — _get_slot_mapping()
 def _get_slot_mapping(self, num_tokens, slot_mapping=None):
     if slot_mapping is not None:
-        self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)  # target의 주소를 복사
+        self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)  # target의 주소 복사
     view = self._slot_mapping_buffer[:num_tokens]
     return {name: view for name in self._draft_attn_layer_names}
-    #      ^^^^                      ^^^^^^^^^^^^^^^^^^^^^^^^^
-    #      "model.layers.32.self_attn": [90, 91, 92, ...]
+    #      → {"model.layers.32.self_attn": [90, 91, 92, ...]}
 ```
 
-`_slot_mapping_buffer`에 들어있는 것은 **KV 데이터가 아니라, slot 주소 배열**이다. `[90, 91, 92, ...]`은 "token 0은 slot 90, token 1은 slot 91, ..."을 의미한다. `num_tokens`는 이번 forward에서 처리하는 token 수 — 첫 forward에서는 target이 처리한 전체 scheduled tokens, 이후 autoregressive loop에서는 batch_size(request당 1개).
+> **target이 만든 slot_mapping(Layer 0~31용)을, draft layer 이름(Layer 32)으로 래핑**하는 것이다. 같은 주소 배열을 공유하되, Layer 32 전용 KV 텐서에 접근하게 된다.
 
-이 dict를 `set_forward_context(slot_mapping=...)`에 전달하면, Layer 32의 attention kernel이 이 주소를 보고 **자기 전용 K/V 텐서**의 해당 slot에 write한다:
-
-```python
-# attention kernel 내부 (모든 layer가 동일한 코드)
-reshape_and_cache_flash(key, value, key_cache, value_cache, slot_mapping, ...)
-#                                   ^^^^^^^^^  ^^^^^^^^^^^
-#                                   Layer 32 전용 텐서 (Layer 0과 다른 메모리)
-```
-
-### 3.4 Attention 시 과거 KV를 읽는 메커니즘
-
-Draft model의 Layer 32가 attention을 수행할 때, `seq_lens`와 `block_table`을 사용하여 이전 position들의 KV를 읽는다. 여기서 읽는 KV는 **Layer 32 자신이 이전에 write한 KV**다.
-
-그렇다면 Layer 32의 과거 KV는 언제 채워지는가?
-
-Draft model의 **첫 번째 forward는 prefill-like**다. Target model이 이번 step에서 처리한 모든 token(1 real + K draft from previous step)을 한꺼번에 처리하며, 각 position에 대한 Layer 32 KV를 생성한다:
-
-```python
-# propose() 내부 — 첫 번째 forward
-num_tokens = target_token_ids.shape[0]  # e.g., 4 (1 real + 3 draft from prev step)
-self.input_ids[:num_tokens] = shifted_target_token_ids
-self.hidden_states[:num_tokens] = target_hidden_states
-# → 4개 token을 한 번에 forward → Layer 32 KV 4개 position 생성
-```
-
-이전 step에서 이미 생성된 Layer 32 KV는 cache에 남아있고, 이번 step에서 새 position의 KV가 추가된다. 따라서 `seq_lens`만큼의 과거를 참조할 때 Layer 32 KV가 충분히 존재한다.
-
-**이후 autoregressive loop**에서는 1개 token씩 forward하며 Layer 32 KV를 1개씩 추가한다. `seq_lens += 1`로 attention 범위가 매번 확장되어, draft model이 **자신의 이전 출력을 참조**할 수 있다. Reject된 draft token의 KV가 Layer 32에 남아있어도 문제 없다 — 다음 step에서 같은 position → 같은 slot에 새 KV를 overwrite하므로, 별도의 invalidation이 필요 없다.
+이 dict를 `set_forward_context(slot_mapping=...)`에 전달하면, `get_attention_context("model.layers.32.self_attn")`가 Layer 32의 KV 텐서와 이 slot_mapping을 꺼내서 attention kernel에 넘긴다:
 
 > **"KV cache 공유"의 정확한 의미**: K/V 데이터가 아니라, block table·slot mapping·block pool을 공유한다. 각 layer는 자기 전용 K/V 텐서에 read/write하되, "position X → slot Y" 규칙만 동일하다.
 
@@ -298,24 +299,7 @@ self._maybe_share_lm_head(target_language_model)
 
 ### 5.1 전체 흐름
 
-`EagleProposer.propose()`는 K개의 draft token을 생성하기 위해 **K번의 autoregressive forward**를 수행한다.
-
-<div class="mermaid">
-flowchart TD
-    A["propose()"] --> B["set_inputs_first_pass()\ntarget hidden states + token ids 준비"]
-    B --> C["Draft Model Forward #1\nfc(cat(embed, hs)) → Transformer → logits"]
-    C --> D["argmax → draft_token_ids[0]"]
-    D --> E{"K == 1?"}
-    E -- Yes --> RET["return draft_token_ids"]
-    E -- No --> LOOP["for token_index in range(K-1):"]
-    LOOP --> F["positions += 1\nslot_mapping 재계산\nseq_lens += 1"]
-    F --> G["Draft Model Forward #(i+2)\ninput: prev draft token + prev hidden state"]
-    G --> H["argmax → draft_token_ids[i+1]"]
-    H --> J{"더 남았나?"}
-    J -- Yes --> LOOP
-    J -- No --> K["torch.stack(draft_token_ids_list)\n→ [batch, K]"]
-    K --> RET
-</div>
+`EagleProposer.propose()`는 K개의 draft token을 생성하기 위해 **K번의 autoregressive forward**를 수행한다. 먼저 `set_inputs_first_pass()`로 target의 hidden states와 token ids를 draft model 입력 형식으로 변환한 뒤, 첫 번째 forward로 draft token 1개를 생성한다 (argmax). 이후 K-1회의 loop에서 매번 `positions += 1`, `seq_lens += 1`, slot_mapping 재계산을 수행하고, 이전 draft token + 이전 hidden state를 입력으로 다음 draft token을 생성한다. 최종적으로 `torch.stack()`으로 `[batch, K]` 텐서를 반환한다.
 
 첫 번째 forward와 이후 forward의 차이가 중요하다:
 
