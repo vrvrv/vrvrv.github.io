@@ -836,6 +836,397 @@ sequenceDiagram
     G-->>V: GPU KV buffer에 KV 복원 완료
 </div>
 
+### 3.3.1 왜 Retrieve 시 "KV의 위치"를 별도로 추적하지 않는가?
+
+위의 store/retrieve 흐름을 보면 자연스러운 의문이 생긴다: store 할 때는 GPU에서 KV를 꺼내서 CPU에 넣으면 되니까 단순하지만, **retrieve 할 때는 "어떤 KV가 어디에 저장되어 있는지"를 알아야 하지 않는가?** 예를 들어 요청의 prefix 500 토큰분 KV가 CPU에 있다면, 그 500 토큰을 256-token chunk 2개로 분할했을 때 각 chunk가 StorageManager의 어디에 있는지를 누군가 기억하고 있어야 할 것 같다.
+
+결론부터 말하면, **별도의 위치 추적이 필요 없다.** 이유는 LMCache가 **content-addressed storage** 구조이기 때문이다 — token sequence 자체가 곧 주소다.
+
+#### Store와 Retrieve의 진입점은 동일하다
+
+두 경로의 코드를 나란히 놓으면 대칭성이 명확해진다:
+
+```python
+# lmcache/v1/cache_engine.py — store() (line 363)
+def store(
+    self,
+    tokens: Optional[Union[torch.Tensor, list[int]]] = None,
+    hashes: Optional[List[int]] = None,
+    offsets: Optional[List[int]] = None,
+    mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> None:
+    # ...
+    chunk_infos = self.token_database.process_tokens(tokens, ...)  # (1) 동일
+    # ...
+    self.gpu_connector.batched_from_gpu(memory_objs, ...)           # (2) GPU → CPU
+    self.storage_manager.batched_put(keys, memory_objs, ...)        # (3) CPU에 저장
+```
+
+```python
+# lmcache/v1/cache_engine.py — retrieve() → _process_tokens_internal() (line 1608)
+def _process_tokens_internal(self, tokens, mask, ret_mask, **kwargs):
+    chunk_infos = self.token_database.process_tokens(tokens, ...)  # (1) 동일
+    block_mapping = self.storage_manager.get_block_mapping(...)     # (2) key로 조회
+    memory_objs = self.storage_manager.batched_get(keys, ...)       # (3) CPU에서 꺼냄
+    # ...
+    self.gpu_connector.batched_to_gpu(memory_objs, ...)             # (4) CPU → GPU
+```
+
+([store](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/cache_engine.py#L363) / [retrieve](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/cache_engine.py#L754) / [_process_tokens_internal](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/cache_engine.py#L1608))
+
+핵심은 **(1)이 동일**하다는 것이다. 두 경로 모두 `token_database.process_tokens(tokens)`를 호출하고, 그 결과로 **동일한 `CacheEngineKey` 리스트**를 얻는다. Store 할 때 key X로 저장했으면, retrieve 할 때도 같은 token sequence에서 key X가 다시 생성되므로, "key X가 어디에 저장되었는지"를 외부에서 추적할 필요가 없다.
+
+#### Content-Addressing의 핵심: `CacheEngineKey`와 Prefix Hash Chain
+
+이 대칭성을 가능하게 하는 것이 [`CacheEngineKey`](https://github.com/LMCache/LMCache/blob/dev/lmcache/utils.py#L340)의 `chunk_hash` 필드다:
+
+```python
+# lmcache/utils.py (line 340)
+@dataclass(slots=True)
+class CacheEngineKey:
+    model_name: str       # "meta-llama/Llama-3-8B"
+    world_size: int       # TP/PP 크기
+    worker_id: int        # 이 rank의 ID
+    chunk_hash: int       # ← token sequence에서 결정론적으로 도출
+    dtype: torch.dtype
+    # ...
+```
+
+`chunk_hash`는 token sequence로부터 **결정론적으로** 계산된다. [`TokenDatabase._prefix_hash()`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/token_database.py#L329)가 256-token chunk마다 rolling hash를 생성하는데, 각 chunk의 hash는 **이전 모든 chunk의 hash에 의존**한다 (prefix hash chain):
+
+```python
+# lmcache/v1/token_database.py — _prefix_hash() (line 329)
+def _prefix_hash(self, token_chunks):
+    prefix_hash = None
+    for chunk in token_chunks:
+        prefix_hash = self._hash_tokens(chunk, prefix_hash=prefix_hash)
+        #              ↑ hash(chunk_i) = f(chunk_i의 token들, hash(chunk_{i-1}))
+        yield prefix_hash
+```
+
+([_prefix_hash](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/token_database.py#L329) / [_hash_tokens](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/token_database.py#L242))
+
+예를 들어 token sequence `[A, B, C, ..., 512개]`가 있으면:
+- Chunk 0 (token 0-255): `hash_0 = f(tokens[0:256], prefix=None)`
+- Chunk 1 (token 256-511): `hash_1 = f(tokens[256:512], prefix=hash_0)`
+
+이 hash chain 덕분에, **같은 token sequence는 언제 호출하든 같은 key를 생성**한다. Store 시점이든 retrieve 시점이든, `process_tokens([A, B, C, ...])` → 동일한 `[CacheEngineKey(chunk_hash=hash_0), CacheEngineKey(chunk_hash=hash_1)]`.
+
+#### StorageManager는 Key-Based Lookup만 수행한다
+
+StorageManager 쪽을 보면 이 구조가 더 명확해진다. Retrieve 시 [`get_block_mapping()`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/storage_backend/storage_manager.py#L950)은 내부적으로 [`batched_contains()`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/storage_backend/storage_manager.py#L910)를 호출하는데, 이 함수는 각 backend를 순회하며 **key가 존재하는지만** 확인한다:
+
+```python
+# lmcache/v1/storage_backend/storage_manager.py — batched_contains() (line 910)
+def batched_contains(self, keys, search_range=None, pin=False):
+    for backend in self._active_storage_backends():
+        hit_chunks = backend.batched_contains(keys, pin)
+        # hit_chunks: 연속된 prefix hit 개수
+        block_mapping[backend_name] = keys[:hit_chunks]
+        keys = keys[hit_chunks:]  # 나머지 key로 다음 backend 탐색
+    return total_hit_chunks, block_mapping
+```
+
+여기서 backend에게 전달하는 것은 오직 **key 리스트**뿐이다. "이 key의 데이터가 pinned memory의 어느 offset에 있는지", "disk의 어느 파일에 있는지" 같은 위치 정보는 **각 backend가 내부적으로 관리**하며, 외부에는 key 기반 인터페이스만 노출한다. `batched_get(keys)`도 마찬가지로 key만 받아서 `MemoryObj`를 반환한다.
+
+#### 정리: "주소 = 내용" 구조가 양방향 대칭성을 만든다
+
+| | Store | Retrieve |
+|---|---|---|
+| **입력** | `token_ids`, `slot_mapping`, `kvcaches` | `token_ids`, `slot_mapping`, `kvcaches` |
+| **Key 생성** | `process_tokens(token_ids)` → `keys[]` | `process_tokens(token_ids)` → `keys[]` (동일) |
+| **StorageManager** | `allocate(keys)` → `batched_put(keys, data)` | `batched_contains(keys)` → `batched_get(keys)` |
+| **GPUConnector** | `batched_from_gpu()` — gather + D2H | `batched_to_gpu()` — H2D + scatter |
+
+Retrieve가 store보다 복잡해 보이는 것은 `batched_contains()` 단계가 추가되기 때문이지, "위치를 별도로 추적"하기 때문이 아니다. 이 단계는 단순히 "이 key가 존재하는가?"를 묻는 것이고, key 자체는 token sequence에서 결정론적으로 도출된다. 전통적인 file system처럼 "path → inode → data block" 같은 간접 참조가 없고, **token sequence 자체가 곧 주소**인 content-addressed 구조가 이 대칭성을 가능하게 한다.
+
+#### 데이터 흐름 상세: 각 단계에서 텐서는 어디에 있는가?
+
+위의 대칭성을 이해했으면, 이제 **물리적으로 데이터가 어디에 있는지**를 단계별로 추적해 보자. "GPUConnector가 D2H를 수행한다"는 설명만으로는 중간에 어떤 버퍼를 거치는지, 복사가 몇 번 일어나는지가 불명확하기 때문이다.
+
+#### MemoryObj와 AllocatorBackend: 데이터가 사는 곳을 결정하는 구조
+
+[`TensorMemoryObj`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/memory_management.py#L472)는 LMCache 내부에서 KV 데이터를 담는 유일한 컨테이너다. 핵심은 `raw_data`가 **어떤 allocator의 pool에서 잘라낸 view인가**에 따라, 이 텐서가 CPU에 있을 수도, GPU에 있을 수도 있다는 것이다:
+
+```python
+# lmcache/v1/memory_management.py — TensorMemoryObj (line 472)
+class TensorMemoryObj(MemoryObj):
+    def __init__(self, raw_data: torch.Tensor, metadata, parent_allocator):
+        self.raw_data = raw_data  # ← allocator pool의 slice (view, 복사 아님)
+                                  #    CPU일 수도, GPU일 수도 있음
+```
+
+([TensorMemoryObj](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/memory_management.py#L472))
+
+**MemoryObj가 CPU에 있는지 GPU에 있는지는 backend의 allocator가 결정한다.** LMCache의 storage backend는 두 가지 인터페이스 계층으로 나뉜다:
+
+- **`AllocatorBackendInterface`**: 자체 memory pool과 allocator를 보유. `allocate()` 호출 시 자신의 pool에서 MemoryObj를 잘라낸다.
+- **`StorageBackendInterface`**: 자체 allocator 없음. 다른 backend의 allocator를 빌려 쓴다.
+
+각 backend는 [`get_allocator_backend()`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/storage_backend/storage_manager.py#L379)를 통해 "내 데이터는 어디에 할당해야 하는가?"를 선언한다:
+
+| Backend | `get_allocator_backend()` 반환 | MemoryObj 위치 | Pool 할당 방식 |
+|---------|-------------------------------|---------------|--------------|
+| **`LocalCPUBackend`** | `self` | **CPU** pinned | `cudaHostAlloc` → pinned memory pool |
+| **`LocalDiskBackend`** | `self.local_cpu_backend` | **CPU** pinned | LocalCPUBackend의 pool 공유 |
+| **`RemoteBackend`** | `self.local_cpu_backend` | **CPU** pinned | LocalCPUBackend의 pool 공유 |
+| **`GdsBackend`** | `self` | **GPU** | `cuFileBufRegister` → GPU memory pool |
+| **`PDBackend`** | `self.local_cpu_backend` | **CPU** pinned | LocalCPUBackend의 pool 공유 |
+
+이 설계의 결과:
+
+- `LocalDiskBackend`는 자체 allocator가 없으므로, LocalCPUBackend의 CPU pool에서 할당된 MemoryObj를 받아서 `write()`로 SSD에 쓴다. **CPU를 반드시 경유**한다.
+- `GdsBackend`는 자체 GPU allocator를 가지고 있으므로, `cuFile.write()`로 GPU 메모리에서 **직접 SSD에 쓴다** (GPU Direct Storage). CPU를 우회한다.
+
+#### `batched_put()`의 multi-backend 분기 로직
+
+[`StorageManager.batched_put()`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/storage_backend/storage_manager.py#L379)는 이 allocator 구조를 활용하여 **backend마다 적절한 메모리에 데이터를 배치**한다:
+
+```python
+# storage_manager.py — batched_put() (line 379)
+def batched_put(self, keys, memory_objs, ...):
+    obj_dict = {}
+    # 최초 MemoryObj는 primary allocator (보통 LocalCPUBackend)의 pool에 있음
+    obj_dict[get_backend_cname(self.allocator_backend)] = (keys, memory_objs)
+
+    for backend_name, backend in self.storage_backends.items():
+        allocator = backend.get_allocator_backend()
+        cname = get_backend_cname(allocator)
+        if cname not in obj_dict:
+            # ⚡ 이 backend는 다른 allocator를 사용 → 새 pool에 할당 + 복사
+            new_keys, new_objs = allocate_and_copy_objects(
+                allocator, keys, memory_objs, self.internal_copy_stream)
+            obj_dict[cname] = (new_keys, new_objs)
+        # 같은 allocator를 공유하는 backend들은 동일한 MemoryObj를 재사용
+        backend.batched_submit_put_task(...)
+```
+
+`get_allocator_backend()`가 같은 객체를 반환하는 backend들은 **하나의 MemoryObj를 공유**하고, 다른 객체를 반환하는 backend만 `allocate_and_copy_objects()`에서 **추가 복사가 발생**한다.
+
+#### Store 경로: backend별 데이터 흐름
+
+아래 다이어그램은 store 시 데이터가 어디에 있는지를 단계별로 보여준다. Step 3까지는 모든 backend에 공통이고, Step 4에서 backend의 allocator에 따라 경로가 갈린다:
+
+<div class="mermaid-wide">
+flowchart TD
+    subgraph step1["Step 1: TokenDatabase — 모든 backend 공통"]
+        direction LR
+        TI["token_ids"] -->|"process_tokens()"| TK["CacheEngineKey[]<br/>(Python 객체, 메모리 이동 없음)"]
+    end
+
+    subgraph step2["Step 2: StorageManager.allocate() — primary allocator에서 할당"]
+        direction LR
+        POOL["Primary Allocator<br/>(보통 LocalCPUBackend)<br/>pinned memory pool"] -->|"slice (view)"| MO_EMPTY["MemoryObj[]<br/>빈 CPU pinned 텐서"]
+    end
+
+    subgraph step3["Step 3: GPUConnector.batched_from_gpu() — GPU → primary MemoryObj"]
+        direction TB
+
+        subgraph pathA["Path A: gpu_buffer 없음"]
+            direction LR
+            A1["GPU paged KV<br/>(scattered)"] -->|"multi_layer_kv_transfer D2H<br/>gather + PCIe 한 번에"| A2["CPU MemoryObj<br/>(contiguous)"]
+        end
+
+        subgraph pathB["Path B: gpu_buffer 있음"]
+            direction LR
+            B1["GPU paged KV<br/>(scattered)"] -->|"kernel gather"| B2["GPU buffer<br/>(contiguous)"]
+            B2 -->|".copy_() bulk DMA"| B3["CPU MemoryObj<br/>(contiguous)"]
+        end
+
+        SYNC["store_stream.synchronize()"]
+    end
+
+    subgraph step4["Step 4: StorageManager.batched_put() — backend별 분기"]
+        direction TB
+
+        subgraph cpu_path["LocalCPUBackend — 같은 allocator"]
+            direction LR
+            CP1["MemoryObj<br/>(이미 자기 pool에 있음)"] -->|"참조만 저장"| CP2["hot_cache#91;key#93;"]
+        end
+
+        subgraph disk_path["LocalDiskBackend — 같은 allocator 공유"]
+            direction LR
+            DP1["같은 CPU MemoryObj"] -->|"write() / O_DIRECT"| DP2["SSD file"]
+        end
+
+        subgraph gds_path["GdsBackend — 별도 GPU allocator ⚠️"]
+            direction LR
+            GP0["GPU paged KV"] -.->|"Step 3에서<br/>이미 D2H 완료"| GP1["CPU MemoryObj"]
+            GP1 -->|"allocate_and_copy<br/>CPU→GPU 재복사"| GP2["GPU cuFile MemoryObj"]
+            GP2 -->|"cuFile.write()<br/>GDS"| GP3["SSD"]
+        end
+    end
+
+    step1 --> step2
+    step2 --> step3
+    step3 --> step4
+
+    style step1 fill:#e8f4fd,stroke:#4a90d9
+    style step2 fill:#fdf8f0,stroke:#e67e22
+    style step3 fill:#fce4e4,stroke:#e74c3c
+    style step4 fill:#f0f0f0,stroke:#666
+    style pathA fill:#fff0f0,stroke:#c0392b,stroke-dasharray:5 5
+    style pathB fill:#fff0f0,stroke:#c0392b,stroke-dasharray:5 5
+    style cpu_path fill:#e8f8e8,stroke:#27ae60
+    style disk_path fill:#fdf8f0,stroke:#e67e22
+    style gds_path fill:#e8e0f0,stroke:#8e44ad
+    style SYNC fill:#f39c12,stroke:#333,color:#fff
+    style A1 fill:#e74c3c,stroke:#333,color:#fff
+    style A2 fill:#e67e22,stroke:#333,color:#fff
+    style B1 fill:#e74c3c,stroke:#333,color:#fff
+    style B2 fill:#9b59b6,stroke:#333,color:#fff
+    style B3 fill:#e67e22,stroke:#333,color:#fff
+    style CP2 fill:#2ecc71,stroke:#333,color:#fff
+    style DP2 fill:#95a5a6,stroke:#333,color:#fff
+    style GP2 fill:#9b59b6,stroke:#333,color:#fff
+    style GP3 fill:#95a5a6,stroke:#333,color:#fff
+</div>
+
+Step 3에서 두 경로가 존재하는 이유를 부연하면: PCIe DMA는 contiguous memory 블록을 전송할 때 가장 효율적이다. vLLM의 paged KV는 물리적으로 흩어져 있으므로, 이를 하나씩 PCIe로 보내면 small transfer가 반복된다. Path B는 **GPU 내에서 먼저 gather하여 contiguous 버퍼에 모은 뒤**, 한 번의 bulk DMA로 CPU에 전송하는 전략이다. 코드에서는 `VLLMPagedMemGPUConnectorV2.__init__()`에서 [`use_gpu`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/gpu_connector/gpu_connectors.py#L179) 플래그로 이 GPU intermediate buffer 사용 여부를 결정한다.
+
+```python
+# gpu_connectors.py — from_gpu() (line 337)
+with torch.cuda.stream(self.store_stream):
+    if self.gpu_buffer is None:  # Path A: 직접 D2H
+        lmc_ops.multi_layer_kv_transfer(
+            memory_obj.tensor,       # 목적지: CPU pinned (MemoryObj)
+            kv_cache_pointers,       # 소스:   GPU paged KV
+            slot_mapping[start:end], # GPU 텐서: token → physical slot
+            direction=D2H,
+        )
+    else:                            # Path B: GPU gather → bulk D2H
+        lmc_ops.multi_layer_kv_transfer(
+            tmp_gpu_buffer,          # 목적지: GPU contiguous buffer
+            kv_cache_pointers,       # 소스:   GPU paged KV
+            slot_mapping[start:end],
+            direction=D2H,
+        )
+        memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
+        #                    ↑ GPU → CPU bulk copy (pinned → DMA 가능)
+self.store_stream.synchronize()  # CPU 코드가 MemoryObj에 접근하기 전에 D2H 완료 보장
+```
+
+([from_gpu](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/gpu_connector/gpu_connectors.py#L304))
+
+Step 4에서 backend별 차이를 정리하면:
+
+- **`LocalCPUBackend`**: MemoryObj가 이미 자신의 pool에 있으므로 [`submit_put_task()`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/storage_backend/local_cpu_backend.py#L141)는 `hot_cache[key] = memory_obj`로 **참조만 저장**한다. 텐서 복사 없음.
+- **`LocalDiskBackend`**: `get_allocator_backend()`가 `LocalCPUBackend`를 반환하므로, 같은 CPU MemoryObj를 공유한다. `async_save_bytes_to_disk()`가 CPU 버퍼의 내용을 `write()`로 SSD에 쓴다. **CPU → SSD 복사 발생**.
+- **`GdsBackend`**: `get_allocator_backend()`가 `self`를 반환하므로, `allocate_and_copy_objects()`가 GDS용 GPU MemoryObj를 새로 할당하고 **CPU→GPU 복사**(H2D)를 수행한다. 이후 `cuFile.write()`로 GPU 메모리에서 SSD에 전송한다. 결과적으로 데이터 경로는 **GPU → CPU → GPU → SSD**가 된다. cuFile.write() 구간(GPU→SSD)은 CPU를 우회하지만, **전체 경로로 보면 CPU를 거치는 불필요한 왕복**이 발생한다.
+
+이 왕복이 발생하는 근본 원인은 [`_get_allocator_backend()`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/storage_backend/storage_manager.py#L315)가 **항상 `LocalCPUBackend`를 primary allocator로 반환**하기 때문이다. GPUConnector는 primary allocator의 MemoryObj(CPU)에만 출력할 수 있으므로, GDS가 활성화되어 있어도 D2H가 먼저 수행된다. 이상적으로는 GPUConnector가 GPU 내에서 gather한 contiguous 버퍼를 GDS의 cuFile-registered GPU 메모리로 직접 전달하면 CPU 왕복을 제거할 수 있지만, 현재 아키텍처에서는 이 경로가 존재하지 않는다.
+
+```python
+# storage_manager.py — _get_allocator_backend() (line 315)
+def _get_allocator_backend(self, config):
+    if self.enable_pd:
+        allocator_backend = self.storage_backends["PDBackend"]
+    else:
+        allocator_backend = self.storage_backends["LocalCPUBackend"]  # ← 항상 CPU
+    return allocator_backend
+```
+
+#### Retrieve 경로
+
+Retrieve는 store의 역방향이다. 이 포스트에서 다루는 LocalCPUBackend 경로에서는 이미 CPU pinned memory에 데이터가 있으므로, GPUConnector가 H2D + scatter를 수행하면 된다:
+
+<div class="mermaid-wide">
+flowchart TD
+    subgraph step1r["Step 1: TokenDatabase — Store와 동일"]
+        direction LR
+        TIR["token_ids"] -->|"process_tokens()"| TKR["CacheEngineKey[]<br/>(동일한 key 재생성)"]
+    end
+
+    subgraph step2r["Step 2: StorageManager.get_block_mapping()"]
+        direction LR
+        KEYS["keys[]"] -->|"batched_contains()<br/>backend 순회"| BM["{backend: keys[]}<br/>메타데이터 조회만"]
+    end
+
+    subgraph step3r["Step 3: StorageManager.batched_get()"]
+        direction TB
+        subgraph cpu_get["LocalCPUBackend hit"]
+            direction LR
+            HCR["hot_cache#91;key#93;"] -->|"참조 반환, 복사 없음"| MOR_CPU["CPU pinned MemoryObj"]
+        end
+        subgraph disk_get["LocalDiskBackend hit"]
+            direction LR
+            SSD_R["SSD file"] -->|"readinto() → CPU"| MOR_DISK["CPU pinned MemoryObj"]
+        end
+        subgraph gds_get["GdsBackend hit"]
+            direction LR
+            SSD_G["SSD file"] -->|"cuFile.read()<br/>SSD → GPU (GDS)"| MOR_GDS["GPU cuFile MemoryObj"]
+        end
+        RC["ref_count_up() — 전송 중 eviction 방지"]
+    end
+
+    subgraph step4r["Step 4: GPUConnector.batched_to_gpu()"]
+        direction LR
+        MORC["MemoryObj<br/>(contiguous)"] -->|"multi_layer_kv_transfer H2D<br/>+ scatter"| GPUKV["GPU Paged KV<br/>(scattered)"]
+        SYNCR["load_stream.synchronize()"]
+    end
+
+    subgraph step5r["Step 5: ref_count_down()"]
+        direction LR
+        RCD["ref_count_down()"] --> FREE["ref=0 → pool 반환 가능"]
+    end
+
+    step1r --> step2r
+    step2r --> step3r
+    step3r --> step4r
+    step4r --> step5r
+
+    style step1r fill:#e8f4fd,stroke:#4a90d9
+    style step2r fill:#f5f0ff,stroke:#8e44ad
+    style step3r fill:#f0f0f0,stroke:#666
+    style step4r fill:#fce4e4,stroke:#e74c3c
+    style step5r fill:#e8f8e8,stroke:#27ae60
+    style cpu_get fill:#e8f8e8,stroke:#27ae60
+    style disk_get fill:#fdf8f0,stroke:#e67e22
+    style gds_get fill:#e8e0f0,stroke:#8e44ad
+    style MORC fill:#e67e22,stroke:#333,color:#fff
+    style GPUKV fill:#e74c3c,stroke:#333,color:#fff
+    style SYNCR fill:#f39c12,stroke:#333,color:#fff
+</div>
+
+Retrieve의 Step 4에서 **중간 GPU buffer를 거치지 않는** 이유: Store 시에는 GPU의 흩어진 page들을 모아야 하므로 gather → bulk copy가 유리하지만, retrieve 시에는 **소스가 이미 contiguous**이므로 한 번의 bulk H2D + GPU 내 scatter로 충분하다. [`to_gpu()`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/gpu_connector/gpu_connectors.py#L241)는 항상 직접 경로만 사용한다:
+
+```python
+# gpu_connectors.py — to_gpu() (line 292)
+lmc_ops.multi_layer_kv_transfer(
+    memory_obj.tensor,       # 소스:   MemoryObj (contiguous)
+    kv_cache_pointers,       # 목적지: GPU paged KV
+    slot_mapping[start:end], # GPU 텐서: token → physical slot
+    direction=H2D,
+)
+```
+
+([to_gpu](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/gpu_connector/gpu_connectors.py#L241))
+
+#### 전체 경로에서 실제 메모리 복사가 발생하는 지점 요약
+
+| 경로 | 복사 지점 | 소스 → 목적지 | 비고 |
+|------|----------|--------------|------|
+| **Store** (공통) | `from_gpu()` | GPU paged → primary MemoryObj | CUDA kernel gather + D2H (Path A) 또는 GPU gather → bulk DMA (Path B) |
+| **Store** → LocalCPU | `batched_put()` | (없음) | 참조만 저장 — MemoryObj가 이미 자기 pool |
+| **Store** → LocalDisk | `batched_put()` | CPU MemoryObj → SSD | `write()` / `O_DIRECT` |
+| **Store** → GDS | `allocate_and_copy` | CPU MemoryObj → GPU cuFile MemoryObj | CPU→GPU 재복사 (왕복) |
+| **Store** → GDS | `batched_put()` | GPU cuFile MemoryObj → SSD | `cuFile.write()` (이 구간만 CPU 우회) |
+| **Retrieve** ← LocalCPU | `batched_get()` | (없음) | 참조만 반환 |
+| **Retrieve** ← LocalDisk | `batched_get()` | SSD → CPU MemoryObj | `readinto()` |
+| **Retrieve** ← GDS | `batched_get()` | SSD → GPU cuFile MemoryObj | `cuFile.read()` (이 구간만 CPU 우회) |
+| **Retrieve** (공통) | `to_gpu()` | MemoryObj → GPU paged | CUDA kernel H2D + scatter |
+
+**핵심 아키텍처 인사이트**:
+
+`get_allocator_backend()` 패턴이 전체 데이터 흐름을 결정한다. 같은 allocator를 공유하는 backend 그룹(LocalCPU/LocalDisk/Remote/PD)은 **하나의 CPU MemoryObj를 참조로 공유**하여 불필요한 복사를 피하고, 독립적인 allocator를 가진 backend(GdsBackend)만 별도 메모리 공간에 복사본을 만든다. 이 구조 덕분에 새로운 storage backend를 추가할 때 기존 데이터 흐름을 건드리지 않고, `get_allocator_backend()`만 구현하면 StorageManager가 자동으로 복사 전략을 결정한다.
+
+다만 현재 아키텍처에는 **구조적 한계**가 있다. primary allocator가 `LocalCPUBackend`로 하드코딩되어 있기 때문에, GdsBackend를 사용해도 **GPU → CPU → GPU → SSD** 왕복이 발생한다. GDS의 본래 목적인 "CPU bypass"가 최종 구간(GPU→SSD)에서만 달성되고, 전체 경로에서는 오히려 CPU 경유 대비 **GPU 메모리 할당 + H2D 복사가 추가**된다. 이를 근본적으로 해결하려면 GPUConnector가 GDS의 cuFile-registered GPU 버퍼에 직접 gather하거나, primary allocator를 GdsBackend로 설정할 수 있어야 하지만, 현재 코드에는 이 경로가 없다.
+
+이 CPU 왕복은 **의도적인 설계 결정**의 결과다. [RFC #1577](https://github.com/LMCache/LMCache/issues/1577)과 그 구현인 [PR #1578](https://github.com/LMCache/LMCache/pull/1578)에서, 원래 문제는 GdsBackend의 GPU allocator(`CuFileMemoryAllocator`)가 `LocalCPUBackend`에 잘못 연결되어 CPU backend가 GPU 메모리를 관리하게 되는 버그였다. 이를 해결하기 위해 각 backend에 독립적인 allocator를 부여하고, backend 간 데이터 이동 시 `allocate_and_copy_objects()`를 거치도록 리팩토링했다. **정확성과 단순성을 위해 성능을 트레이드오프**한 것이다.
+
+현재 GDS 관련 진행 중인 PR들([#2802](https://github.com/LMCache/LMCache/pull/2802) parallel I/O thread pool, [#2817](https://github.com/LMCache/LMCache/pull/2817) multipath NVMe offloading, [#2858](https://github.com/LMCache/LMCache/pull/2858) AMD hipFile 지원)은 모두 **현재 아키텍처 위에서의 개선**이며, 근본적인 CPU 왕복 문제를 다루지는 않는다. GDS의 주요 사용 시나리오가 대용량 KV를 SSD에 내리는 것이고 이때 bottleneck이 SSD I/O bandwidth인 점을 감안하면, CPU 왕복의 추가 latency가 전체 성능에 미치는 영향이 상대적으로 작아 우선순위가 낮은 것으로 보인다.
+
 ### 3.4 GPUConnector: 하드웨어 추상화와 구현
 
 위의 store/retrieve 흐름에서 `GPUConnector`가 "CUDA kernel로 복사"한다고만 설명했는데, 실제 구현은 상당히 정교하다. vLLM의 paged KV buffer와 LMCache의 contiguous chunk 사이의 **format 변환**, **async stream 관리**, **pinned memory 할당**, **layerwise double-buffering**이 모두 하드웨어 종속적인 primitive 위에 구축되어 있다.

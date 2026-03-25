@@ -29,6 +29,9 @@ plugins:
 
 remote-theme: no-style-please
 
+exclude:
+  - .jektex-cache
+
 jektex:
   cache_dir: ".jektex-cache"
   ignore: ["*.xml"]
