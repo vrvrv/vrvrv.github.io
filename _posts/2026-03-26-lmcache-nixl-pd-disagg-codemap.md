@@ -1,6 +1,6 @@
 ---
 layout: post
-title: "LMCache KV Cache Offloading (2) - P/D Disaggregation: NIXL Connector vs LMCache + NIXL"
+title: "LMCache KV Cache Offloading (2) - NIXL Connector vs LMCache + NIXL"
 category: llm-serving
 ---
 
