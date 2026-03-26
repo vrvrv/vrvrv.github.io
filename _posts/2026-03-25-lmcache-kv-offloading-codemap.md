@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "LMCache KV Cache Offloading (1) - Overview"
-category: llm-serving
+category: kv-connector
 ---
 
 > **Note**: 이 포스트는 [vLLM v0.17.1](https://github.com/vllm-project/vllm/tree/v0.17.1) 기준으로 작성되었습니다. 이후 버전에서 API나 내부 구조가 변경되었을 수 있습니다.

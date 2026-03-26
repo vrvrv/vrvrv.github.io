@@ -1,6 +1,6 @@
 ---
 layout: post
-category: llm-serving
+category: speculative-decoding
 title: "Speculative Decoding in vLLM v1 (2): EAGLE / EAGLE3"
 ---
 

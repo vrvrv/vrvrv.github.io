@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "LMCache KV Cache Offloading (2) - NIXL Connector vs LMCache + NIXL"
-category: llm-serving
+category: kv-connector
 ---
 
 > **Note**: 이 포스트는 vLLM `main` 브랜치 (2026-03-27 기준)와 [LMCache `dev` 브랜치](https://github.com/LMCache/LMCache/tree/dev)를 기준으로 작성되었습니다.
