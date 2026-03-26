@@ -588,3 +588,152 @@ for backend in self.storage_backends:
 | **GPU 메모리 추가 사용** | 없음 (기존 KV cache 재사용) | PDBackend 버퍼 별도 할당 |
 
 결국 **"전송 속도 vs 기능 범위"의 트레이드오프**다. 순수 P/D disaggregation만 필요하면 NIXL Connector가 최적이고, multi-tiered caching이 필요한 복잡한 시나리오에서는 LMCache가 그 오버헤드만큼의 가치를 제공한다.
+
+---
+
+## 8. 제3의 선택지: MultiConnector와 다른 Connector들
+
+NIXL Connector 단독 vs LMCache + NIXL만이 선택지는 아니다. vLLM에는 **MultiConnector**로 여러 connector를 조합하는 방식과, Mooncake/FlexKV 같은 대안 connector도 있다.
+
+### 8.1 MultiConnector: NIXL + OffloadingConnector 조합
+
+vLLM의 [`MultiConnector`](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py)는 여러 `KVConnectorBase_V1`을 하나로 합성한다. NIXL(P/D 전송) + OffloadingConnector(CPU offloading)를 조합하면 LMCache 없이도 두 기능을 동시에 사용할 수 있다:
+
+```json
+{
+  "kv_connector": "MultiConnector",
+  "kv_connector_extra_config": {
+    "connectors": [
+      {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+      {"kv_connector": "OffloadingConnector", "kv_role": "kv_both",
+       "kv_connector_extra_config": {"cpu_bytes_to_use": 1073741824}}
+    ]
+  }
+}
+```
+
+핵심 동작 원칙: **Load는 first-wins, Save는 all-connectors**.
+
+- **Load**: 설정 순서대로 connector를 순회하며 `get_num_new_matched_tokens()` 호출. 먼저 `toks > 0`을 반환하는 connector가 load를 담당한다. NIXL이 첫 번째면 remote KV 우선, 없으면 OffloadingConnector가 CPU cache에서 load.
+- **Save**: `save_kv_layer()` / `wait_for_save()`가 **모든 connector에** 호출된다. NIXL은 decode 노드에 전송, OffloadingConnector는 동시에 CPU에 offload.
+
+이 조합의 P/D 전송은 NIXL의 직접 RDMA (1회 복사)를 유지하므로, LMCache의 3회 복사 오버헤드를 피한다.
+
+#### MultiConnector의 한계
+
+**1. Garbage KV 문제 ([#34526](https://github.com/vllm-project/vllm/issues/34526))**
+
+가장 심각한 known issue였다. NIXL이 RDMA로 KV를 아직 load 중인데, OffloadingConnector가 같은 GPU 블록을 CPU에 offload하면 **초기화되지 않은 쓰레기 값**이 CPU에 저장된다. 후속 요청이 이 garbage KV를 CPU에서 load하면 accuracy corruption이 발생한다.
+
+[PR #35092](https://github.com/vllm-project/vllm/pull/35092)에서 수정되었지만, 근본적으로 **connector 간 동기화 메커니즘이 부재**하다는 구조적 문제를 보여준다. MultiConnector는 각 connector를 독립적으로 호출할 뿐, connector 간 상태를 조율하는 계층이 없다.
+
+**2. CPU-only offloading — SSD/disk 미지원**
+
+`OffloadingConnector`의 유일한 구현체인 `CPUOffloadingSpec`은 **CPU 메모리만** 지원한다. SSD offloading은 구현되어 있지 않다. `OffloadingSpec`이 추상 클래스라 확장 가능하지만, 현재 코드에는 없다.
+
+**3. 단일 노드 한정 — 분산 lookup 없음**
+
+OffloadingConnector는 **로컬 CPU cache만** 관리한다. 다른 노드의 CPU cache를 조회하거나, 크로스-노드 KV 공유는 불가능하다. LMCache의 Cache Controller + P2P backend 같은 분산 lookup 메커니즘이 없다.
+
+**4. Content-addressed caching 없음**
+
+OffloadingConnector는 vLLM의 `BlockHash`(블록 단위 토큰 해시)를 사용한다. LMCache의 prefix hash chain(256-token chunk, 이전 chunk의 hash에 의존)보다 **granularity가 굵고**, cross-request prefix dedup 능력이 제한적이다. 정확한 block boundary에서의 exact match만 가능하다.
+
+**5. Layer pipelining 없음**
+
+OffloadingConnector의 `wait_for_layer_load()`와 `save_kv_layer()`는 **no-op**이다. 모든 전송이 bulk로 처리되어, forward pass 중 GPU idle이 발생할 수 있다.
+
+**6. HMA 호환성 문제 ([#36547](https://github.com/vllm-project/vllm/issues/36547))**
+
+Hybrid Memory Allocator(HMA) 마이그레이션 이후, MultiConnector가 `SupportsHMA` 인터페이스를 제대로 위임하지 않아 NIXL 전송이 **조용히 실패**하는 문제가 있었다. [PR #36549](https://github.com/vllm-project/vllm/pull/36549)에서 수정됨.
+
+#### MultiConnector vs LMCache 비교
+
+| | MultiConnector (NIXL + Offloading) | LMCache + NIXL |
+|---|---|---|
+| **P/D latency** | 최소 (1회 RDMA) | 높음 (3회 복사) |
+| **CPU offloading** | 지원 (CPU만) | 지원 (CPU + SSD + Redis + ...) |
+| **SSD offloading** | 미지원 | 지원 (GDS, POSIX, NIXL storage) |
+| **분산 KV lookup** | 미지원 (로컬만) | Cache Controller + P2P |
+| **Content-addressed caching** | block hash (vLLM 내장) | token hash chain (256-token chunk) |
+| **Layer pipelining** | 미지원 (bulk) | 지원 (layerwise connector) |
+| **Multi-turn 최적화** | 기본 (block hash dedup) | save_decode_cache + 다중 backend |
+| **Heterogeneous TP** | 지원 (NIXL) | 미지원 |
+| **안정성** | 알려진 race condition (#34526) | 단일 엔진 내 동기적 처리 |
+| **외부 의존성** | 없음 (vLLM 내장) | LMCache 라이브러리 필요 |
+
+### 8.2 Mooncake Connector
+
+[MooncakeConnector](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/)는 [Mooncake TransferEngine](https://github.com/kvcache-ai/Mooncake)을 사용하는 P/D disaggregation connector다.
+
+NIXL Connector와 비교하면:
+
+| | NIXL | Mooncake |
+|---|---|---|
+| **전송 모델** | Pull (decode가 READ) | Push (prefill이 WRITE) |
+| **Transport** | UCX/RDMA (NIXL) | Mooncake TransferEngine (RDMA/TCP) |
+| **Discovery** | ZMQ handshake | HTTP bootstrap server |
+| **Het. TP** | 지원 | 지원 |
+| **PP (Pipeline Parallel)** | 지원 | 미지원 |
+| **Offloading** | 미지원 (MultiConnector로 조합 가능) | 미지원 |
+
+Mooncake도 **P/D 전용**이며 offloading은 지원하지 않는다. NIXL과의 핵심 차이는 **push vs pull 모델**: Mooncake는 prefiller가 decoder에게 KV를 보내는 push 방식이고, NIXL은 decoder가 prefiller의 GPU 메모리를 읽어가는 pull 방식이다.
+
+알려진 이슈로 HBM leak ([#36014](https://github.com/vllm-project/vllm/issues/36014))이 있다.
+
+### 8.3 FlexKV Connector
+
+[FlexKVConnector](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py)는 [taco-project/FlexKV](https://github.com/taco-project/FlexKV) 라이브러리를 사용하는 connector다. LMCache와 유사하게 **multi-level caching** (CPU + SSD + remote storage)을 지원한다.
+
+| | LMCache | FlexKV |
+|---|---|---|
+| **Storage 계층** | CPU, SSD (GDS), Redis, P2P, NIXL storage | CPU, SSD, remote (외부 라이브러리) |
+| **Transfer 방식** | Worker에서 GPUConnector 경유 | Scheduler에서 관리 (worker는 no-op) |
+| **Layer pipelining** | 지원 | 미지원 |
+| **P/D disaggregation** | NIXL PDBackend | 미확인 |
+| **vLLM 통합** | 12KB wrapper + 외부 라이브러리 | ~200 lines wrapper + 외부 라이브러리 |
+
+FlexKV의 특이점은 **scheduler-side에서 모든 KV 전송을 관리**한다는 것이다. `start_load_kv()`, `save_kv_layer()`, `wait_for_save()` 모두 no-op이고, `request_finished()` 시점에 비동기로 offloading이 수행된다.
+
+### 8.4 전체 Connector 지형도
+
+<div class="mermaid-wide">
+flowchart TD
+    subgraph pd["P/D Disaggregation"]
+        NIXL["NIXL Connector<br/>직접 RDMA, 1회 복사<br/>Het. TP 지원"]
+        MOON["Mooncake Connector<br/>Push 모델, RDMA/TCP"]
+    end
+
+    subgraph offload["KV Offloading"]
+        OFF["OffloadingConnector<br/>CPU only, block hash"]
+    end
+
+    subgraph hybrid["P/D + Offloading + Storage"]
+        LMC["LMCache Connector<br/>NIXL PDBackend + LocalCPU<br/>+ SSD + Redis + P2P"]
+        FKV["FlexKV Connector<br/>CPU + SSD + Remote"]
+    end
+
+    subgraph combo["조합"]
+        MULTI["MultiConnector<br/>NIXL + Offloading 조합<br/>⚠️ race condition 이력"]
+    end
+
+    NIXL --> MULTI
+    OFF --> MULTI
+
+    style pd fill:#fce4e4,stroke:#e74c3c
+    style offload fill:#fdf8f0,stroke:#e67e22
+    style hybrid fill:#e8f4fd,stroke:#4a90d9
+    style combo fill:#f5f0ff,stroke:#8e44ad
+    style NIXL fill:#e74c3c,stroke:#333,color:#fff
+    style MOON fill:#c0392b,stroke:#333,color:#fff
+    style OFF fill:#e67e22,stroke:#333,color:#fff
+    style LMC fill:#4a90d9,stroke:#333,color:#fff
+    style FKV fill:#2980b9,stroke:#333,color:#fff
+    style MULTI fill:#8e44ad,stroke:#333,color:#fff
+</div>
+
+정리하면:
+- **P/D만 필요**: NIXL 또는 Mooncake
+- **Offloading만 필요**: OffloadingConnector 또는 FlexKV
+- **P/D + Offloading**: MultiConnector(NIXL + Offloading), LMCache, 또는 FlexKV
+- **P/D + Offloading + 분산 caching + SSD**: LMCache가 현재 유일한 통합 솔루션
